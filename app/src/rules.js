@@ -1,5 +1,5 @@
 // 全部识别规则集中在此（正则 / 标签词 / 清单分组 / NER 类型映射）。detect.js 只负责执行。
-// 字段：name 显示名；en 受哪个勾选项控制；cls 高亮配色；warn 需手动复核；re 正则（全局）；check 二次校验；hint 示例
+// 字段：name 显示名；en 受哪个勾选项控制；cls 高亮配色（style.css 的 --hl-<cls>）；warn 需手动复核（按 warn 配色）；re 正则（全局）；check 二次校验；hint 示例
 
 // 微软官方说明：检查文档时可删除的隐藏数据和个人信息
 export const FINGERPRINT_URL = 'https://support.microsoft.com/zh-cn/office/collab-files/remove-hidden-data-and-personal-information-by-inspecting-documents-presentations-or-workbooks';
@@ -35,7 +35,7 @@ function companyLead(text) {
 export const RULES = {
   patent: { name: 'ZL专利号', cls: 'warn', warn: true, re: /ZL\s?\d{4}\s?[\dXx]{6,9}(?:\.[\dXx])?/gi, hint: 'ZL202110123456.7' },
   date: {
-    name: '日期和百分比', cls: 'tag', hint: '2022-03-03、2026年5月、30%',
+    name: '日期和百分比', cls: 'date', hint: '2022-03-03、2026年5月、30%',
     re: /\d{4}\s?年\s?\d{1,2}\s?月(?:\s?\d{1,2}\s?日)?|\d{4}-\d{1,2}(?:-\d{1,2})?(?!\d)|\d{4}\/\d{1,2}(?:\/\d{1,2})?(?!\d)|\d{4}\.\d{1,2}\.\d{1,2}(?!\d)|\d+(?:\.\d+)?\s?%|\d{4}\s?年度?/g,
   },
   // ZL专利号选项还包括：「发明专利」「专利号」字样，以及「一种……」开头的专利名称（一种 + 5 个以上非空白字符，以空白结束）
@@ -47,15 +47,15 @@ export const RULES = {
   credit: { name: '统一社会信用代码', cls: 'warn', re: /(?<![0-9A-Za-z])[0-9A-HJ-NP-RTUWXY]{2}\d{6}[0-9A-HJ-NP-RTUWXY]{10}(?![0-9A-Za-z])/g, hint: '91320900MA7HAK6C0X' },
   idcard: { name: '身份证号', cls: 'warn', re: /(?<!\d)[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)/g, hint: '320902199001011234' },
   cname: { name: '姓名（标签后）', cls: 'warn', re: new RegExp(`(?<=(?:姓名|联系人|负责人|法定代表人|法人代表|填报人|申报人|项目负责人|经办人|代表人)[：:]\\s?)[${cn}·]{2,4}`, 'g'), hint: '联系人：徐天祥' },
-  company: { name: '公司／组织名称', cls: 'tag', re: new RegExp(`(?<=[：:，,。；;、“"（(\\s|*]|^)[${cn}A-Za-z0-9（）()]{2,24}?(?:集团股份有限公司|集团有限公司|股份有限公司|有限责任公司|有限公司|分公司|事务所|研究院|研究所)`, 'gm'), lead: companyLead, hint: '超维微电子（盐城）有限公司' },
-  addr: { name: '地址', cls: 'tag', re: new RegExp(`[${cn}]{2,12}(?:省|市)[${cn}]{1,10}(?:区|县)[${cn}\\d\\-]{1,25}?(?:号|栋|幢|楼|室)`, 'g'), hint: '盐城市盐都区盐渎路999号' },
+  company: { name: '公司／组织名称', cls: 'company', re: new RegExp(`(?<=[：:，,。；;、“"（(\\s|*]|^)[${cn}A-Za-z0-9（）()]{2,24}?(?:集团股份有限公司|集团有限公司|股份有限公司|有限责任公司|有限公司|分公司|事务所|研究院|研究所)`, 'gm'), lead: companyLead, hint: '超维微电子（盐城）有限公司' },
+  addr: { name: '地址', cls: 'addr', re: new RegExp(`[${cn}]{2,12}(?:省|市)[${cn}]{1,10}(?:区|县)[${cn}\\d\\-]{1,25}?(?:号|栋|幢|楼|室)`, 'g'), hint: '盐城市盐都区盐渎路999号' },
   intl: { name: '国际电话', cls: 'phone', re: /(?<![\w+])\+\d{1,3}[\s-]?\(?\d{1,4}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}(?!\d)/g, hint: '+86 138 0013 8000' },
   ssn: { name: '美国社会安全码 (SSN)', cls: 'warn', re: /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/g, hint: '123-45-6789' },
   card: { name: '信用卡号', cls: 'warn', re: /(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)/g, check: luhn, hint: '4242 4242 4242 4242' },
   iban: { name: 'IBAN 国际银行账号', cls: 'warn', re: /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?\b/g, hint: 'GB82 WEST 1234 5698 7654 32' },
-  ip4: { name: 'IPv4 地址', cls: 'tag', re: /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])/g, hint: '192.168.1.10' },
-  ip6: { name: 'IPv6 地址', cls: 'tag', re: /(?<![\w:])(?:[A-Fa-f0-9]{1,4}:){1,7}:?(?:[A-Fa-f0-9]{1,4})?(?![\w:])/g, check: (s) => s.includes('::') || (s.match(/:/g) || []).length === 7, hint: '2001:db8::1' },
-  url: { name: '网址', cls: 'tag', re: /https?:\/\/[^\s)）"”'’<>|*]+/g, hint: 'https://example.com' },
+  ip4: { name: 'IPv4 地址', cls: 'net', re: /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])/g, hint: '192.168.1.10' },
+  ip6: { name: 'IPv6 地址', cls: 'net', re: /(?<![\w:])(?:[A-Fa-f0-9]{1,4}:){1,7}:?(?:[A-Fa-f0-9]{1,4})?(?![\w:])/g, check: (s) => s.includes('::') || (s.match(/:/g) || []).length === 7, hint: '2001:db8::1' },
+  url: { name: '网址', cls: 'net', re: /https?:\/\/[^\s)）"”'’<>|*]+/g, hint: 'https://example.com' },
   birth: { name: '出生日期', cls: 'warn', re: /(?<=(?:出生日期|出生年月|生日)[：:]\s?)\d{4}[-年/.]\d{1,2}(?:[-月/.]\d{1,2}日?)?/g, hint: '出生日期：1985-03-14' },
 };
 for (const [id, r] of Object.entries(RULES)) r.en ||= id;

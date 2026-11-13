@@ -7,7 +7,7 @@
 </head>
 <body>
 <header class="top">
-  <div class="brand"><span id="logo" class="logo" title="点击切换深色/浅色">HD</span><h1>数据集打码工作流</h1><span class="sub">应断网使用 · 用小模型辅助</span></div>
+  <div class="brand"><span id="logo" class="logo" title="点击切换主题：浅色 / 深色 / Omarchy">HD</span><h1>数据集打码工作流</h1><span class="sub">应断网使用 · 用小模型辅助</span></div>
   <div class="top-r">
     <button id="modelWarn" class="warnchip" hidden title="点击选择 .onnx 模型文件，或把含模型的文件夹拖进来">⚠️ 离线模型未载入</button>
     <span id="pill" class="pill" title="">总共0次删除</span>
@@ -32,7 +32,7 @@
     <div id="toolList" class="checks"></div>
 
     <h3>删除时（替换）规则</h3>
-    <textarea id="rules" class="mini" rows="2" spellcheck="false" placeholder="每行一条：正则 => 替换，自上而下取第一条匹配。&#10;::类别:: 前缀只作用于该类别（如 ::cname::、::addr::、::PERSON::）。&#10;替换里 {表达式} 可用 s=命中文本、$m=匹配数组（$m[0] 整段、$m[1] 第1组）、kind=类别名；$1 也可用。&#10;例：::cname:: .* => {s[0]}姓人员&#10;例：.* => {kind}{__di.ruleNth(kind, s)}（地址1、地址2…，同一文档内同类递增）"></textarea>
+    <textarea id="rules" class="mini" rows="2" spellcheck="false" placeholder="每行一条：正则 => 替换，自上而下取第一条匹配。&#10;::类别:: 前缀只作用于该类别（如 ::cname::、::addr::、::PERSON::）。&#10;替换里 {…} 可用 s=命中文本、$m=匹配数组（$m[0] 整段、$m[1] 第1组）、kind=类别名，可接 [n] / .length / .slice(a,b)；$1 也可用。&#10;例：::cname:: .* => {s[0]}姓人员&#10;例：.* => {kind}{nth()}（地址1、地址2…，同一文档内同类递增）"></textarea>
 
     <h3>黑名单词汇</h3>
     <textarea id="black" class="mini" rows="6" spellcheck="false" placeholder="每行一个黑名单词；=== 行以下由右侧面板自动同步"></textarea>
@@ -54,10 +54,11 @@
       <div id="chapters" class="chapters" hidden></div>
     </div>
   </main>
+  <div class="gutter" data-side="l" title="拖动调整宽度，双击恢复"></div><div class="gutter" data-side="r" title="拖动调整宽度，双击恢复"></div>
 
   <aside class="right">
     <div class="panels">
-      <section class="panel"><div class="ph"><b>实体清单</b><button id="cnt-man" class="of mono" data-all="ent" title="点击全选 / 全不选"></button></div><div id="entList"></div>
+      <section class="panel"><div class="ph"><b>实体清单</b><button id="cnt-ent" class="of mono" data-all="ent" title="点击全选 / 全不选"></button></div><div id="entList"></div>
         <div id="addBox"><button id="addMan" class="add">+ Add</button></div></section>
       <section class="panel"><div class="ph"><b>简称/电话/专利号 <span class="locn" data-lp="tag" title="右键芯片查找下一个；点此继续"></span></b><button id="cnt-tag" class="of mono" data-all="tag" title="点击全选 / 全不选"></button></div><div id="tagList" class="chips"></div></section>
       <section class="panel"><div class="ph"><b>人名地名 <span class="locn" data-lp="place" title="右键芯片查找下一个；点此继续"></span></b><button id="cnt-place" class="of mono" data-all="place" title="点击全选 / 全不选"></button></div><div id="placeList" class="chips"></div></section>

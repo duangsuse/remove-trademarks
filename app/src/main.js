@@ -1,6 +1,6 @@
 import './style.css';
-import { parseDocx, computeEdits, exportDocx, listImages } from './docx.js';
-import { scan, parseRules, parseCustom, parseBlackLines, replacement, selection, chapters } from './detect.js';
+import { DocxProjection, listImages } from './docx.js';
+import { scan, parseRules, parseCustom, parseBlackLines, replacement, selection, chapters, plainOf, unmark, nerLines } from './detect.js';
 import { MAIN, EXTRA, TOOLS, TYPE_NAME, DEFAULT_REPLACE_RULES, HIDE_WHEN_OFF, TAG_CATS, ENT_CATS, TITLE_RE, ABBR_MAX, RULES, FINGERPRINT_URL, ABBR_RE, NAME_LABELS, NAME_VALUE } from './rules.js';
 import * as ner from './ner.js';
 
@@ -10,14 +10,35 @@ const mb = (n) => (n / 1048576).toFixed(2) + ' MB';
 const store = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* 无存储 */ } } };
 
 // ---------- 主题：点 logo 切换 ----------
-const root = document.documentElement;
+const root = document.documentElement, THEMES = ['light', 'dark', 'omarchy'];
 root.dataset.theme = store.get('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-$('logo').onclick = () => { root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark'; store.set('theme', root.dataset.theme); };
+$('logo').onclick = () => { root.dataset.theme = THEMES[(THEMES.indexOf(root.dataset.theme) + 1) % THEMES.length]; store.set('theme', root.dataset.theme); };
+// 高亮类别（rules.js 的 cls 与 top1~3）：底色取各主题的 --hl-<类别>
+const HL = ['tag', 'warn', 'place', 'cand', 'black', 'phone', 'mail', 'person', 'company', 'addr', 'date', 'net', 'abbr', 'custom', 'top1', 'top2', 'top3'];
+document.head.append(Object.assign(document.createElement('style'), { textContent: HL.map((k) => `::highlight(${k}), .badge.${k}, .row.${k} { background-color: var(--hl-${k}); }`).join('\n') }));
 
 // URL 带 #editor：关闭脱敏功能，当作纯文本投影编辑器（Ctrl+S → _新版.docx）；左栏只剩章节，右栏仅在粘贴时更新
 const EDITOR = location.hash === '#editor';
 addEventListener('hashchange', () => location.reload());
 document.body.classList.toggle('ed', EDITOR);
+
+// ---------- 左右栏宽度：拖动分隔条，双击恢复默认 ----------
+const layout = document.querySelector('.layout');
+for (const side of ['l', 'r']) { const w = store.get('w' + side); if (w) layout.style.setProperty(`--${side}w`, w + 'px'); }
+layout.addEventListener('pointerdown', (e) => {
+  const g = e.target.closest('.gutter'); if (!g) return;
+  e.preventDefault(); g.setPointerCapture(e.pointerId); g.classList.add('drag');
+  const side = g.dataset.side, box = layout.getBoundingClientRect();
+  g.onpointermove = (ev) => {
+    const w = Math.round(Math.min(Math.max(side === 'l' ? ev.clientX - box.left : box.right - ev.clientX, 180), box.width * 0.45));
+    layout.style.setProperty(`--${side}w`, w + 'px'); store.set('w' + side, w);
+  };
+  g.onpointerup = () => { g.onpointermove = g.onpointerup = null; g.classList.remove('drag'); };
+});
+layout.addEventListener('dblclick', (e) => {
+  const g = e.target.closest('.gutter'); if (!g) return;
+  layout.style.removeProperty(`--${g.dataset.side}w`); store.set('w' + g.dataset.side, '');
+});
 
 // ---------- 状态 ----------
 // 脱敏的唯一来源是左栏两个大框：黑名单（词 / 行号 #L11~L222）与「删除时（替换）规则」。
@@ -203,8 +224,9 @@ function paintHighlights(occ) {
   for (const o of occ.sort((a, b) => a.s - b.s || b.e - a.e)) {
     if (o.s < p) continue;
     p = o.e;
-    const k = isOn(o.it) ? cls(o.it) : 'off';
-    (by[k] ||= new Highlight()).add(rangeOf(o.s, o.e));
+    const on = isOn(o.it), ranked = top.has(o.it.key), r = rangeOf(o.s, o.e);
+    (by[on || ranked ? cls(o.it) : 'off'] ||= new Highlight()).add(r); // 前 3 名不论选没选都整段着色，未选再加下划线
+    if (ranked && !on) (by.off ||= new Highlight()).add(r);
   }
   for (const k in by) CSS.highlights.set(k, by[k]);
 }
@@ -212,7 +234,14 @@ let items = new Map(), live = [], sel = [], tm = 0, chs = [];
 const enabled = (it) => !!state.cats[it.en];
 const listed = (it) => enabled(it) || !HIDE_WHEN_OFF.has(it.en);
 const isOn = (it) => (it.key in state.on ? state.on[it.key] : enabled(it) && base(it));
-const cls = (it) => (it.warn || TITLE_RE.test(it.text) ? 'warn' : it.cls); // 称谓代词（XX经理）红色
+// 配色：按规则类别（rules.js 的 cls）；NER 识别出的实体按出现次数前 3 各有一色；称谓代词（XX经理）红色
+const cls = (it) => top.get(it.key) || (it.warn || TITLE_RE.test(it.text) ? 'warn' : it.cls);
+const rankTag = (it) => (top.has(it.key) ? `<b class="rank">#${top.get(it.key).slice(3)}</b>` : '');
+const top = new Map();
+function rankNer() {
+  top.clear();
+  [...items.values()].filter((it) => it.cat === 'ner').sort((a, b) => b.occ.length - a.occ.length).slice(0, 3).forEach((it, i) => top.set(it.key, 'top' + (i + 1)));
+}
 
 function refresh(now) { clearTimeout(tm); tm = setTimeout(run, now ? 0 : 160); }
 function run() {
@@ -221,6 +250,7 @@ function run() {
   readHead();
   const md = ta.value;
   items = scan(md, state);
+  rankNer();
   live = [...items.values()].filter(listed);
   sel = selection(live, isOn);
   const occ = [];
@@ -244,7 +274,7 @@ const ruleNth = (kind, s) => { // 同类（kind）内按首次出现顺序编号
   if (!m.has(key)) m.set(key, m.size + 1);
   return m.get(key);
 };
-const replOf = (it, text) => (it.del ? '' : replacement(text, undefined, rules(), { names: [it.cat, it.en, it.type], kind: kindOf(it) }));
+const replOf = (it, text) => (it.del ? '' : replacement(text, rules(), { names: [it.cat, it.en, it.type], kind: kindOf(it), nth: ruleNth }));
 
 function updateCounts() {
   const cnt = {};
@@ -265,23 +295,28 @@ function panelOf(it) {
   if (ENT_CATS.has(it.cat)) return 'ent';
   return 'cand';
 }
-const panels = { ent: [], place: [], tag: [], cand: [] };
-const chip = (it) => `<span class="badge ${cls(it)} ${isOn(it) ? 'on' : 'off'}" data-key="${esc(it.key)}" title="${esc(it.text)}">${esc(it.show || it.text)}<small>${it.occ.length}</small></span>`;
 const kindOf = (it) => (it.cat === 'tblname' && it.del ? '含姓名表格 · 行号' : it.cat === 'black' ? (it.del ? '行号' : '手动') : it.cat === 'ner' ? TYPE_NAME[it.type] || it.type : RULES[it.cat]?.name || it.label || '规则');
-const rowOf = (it, extra = '') => `<div class="row ${isOn(it) ? 'on' : ''}"><input type="checkbox" data-key="${esc(it.key)}" ${isOn(it) ? 'checked' : ''}><div class="t">${esc(it.show ? it.show + ' ' : '')}${esc(it.text)}<small>${kindOf(it)} · ${it.occ.length}次</small></div>${extra}${locBtn(it)}<button class="ren" data-ren="${esc(it.key)}" title="重命名（留空即删除）">✎</button></div>`;
+// 两种条目视图，开关都由 data-key 所在元素的点击统一处理（见 rightEl click）
+const chip = (it) => `<span class="badge ${cls(it)} ${isOn(it) ? 'on' : 'off'}" data-key="${esc(it.key)}" title="${esc(it.text)}">${rankTag(it)}${esc(it.show || it.text)}<small>${it.occ.length}</small></span>`;
+const scoreOf = (it) => `<span class="score">${it.cat === 'ner' ? it.score.toFixed(2) : '0'}</span>`;
+const rowOf = (it, extra = '') => `<div class="row ${isOn(it) ? 'on' : ''} ${top.get(it.key) || ''}" data-key="${esc(it.key)}"><input type="checkbox" ${isOn(it) ? 'checked' : ''}><div class="t">${rankTag(it)}${esc(it.show ? it.show + ' ' : '')}${esc(it.text)}<small>${kindOf(it)} · ${it.occ.length}次</small></div>${extra}${locBtn(it)}<button class="ren" data-ren="${esc(it.key)}" title="重命名（留空即删除）">✎</button></div>`;
+// 四张卡片：#<id>List 放条目，#cnt-<id> 显示 选中 OF 总数；只在视图、空提示、置信度上有差别。条目一律按出现次数从多到少
+const PANELS = [
+  { id: 'ent', item: (it) => rowOf(it), empty: () => '暂无。点下方 Add，或在正文选中文字按 Delete' },
+  { id: 'tag', item: chip, empty: () => '无' },
+  { id: 'place', item: chip, empty: () => (ner.ready() ? '无' : '未载入模型，仅规则识别可用') },
+  { id: 'cand', item: (it) => rowOf(it, scoreOf(it)), empty: () => (ner.ready() ? '无备选' : '请先载入离线模型') },
+];
+const panels = Object.fromEntries(PANELS.map((p) => [p.id, []]));
 function renderPanels() {
   for (const k in panels) panels[k] = [];
   for (const it of live) panels[panelOf(it)].push(it);
-  panels.cand.sort((a, b) => (b.score || 0) - (a.score || 0) || b.occ.length - a.occ.length);
-  const count = (list) => (list.length ? `${list.filter(isOn).length} OF ${list.length}` : '0'); // 按规则（条目）数，不是匹配数
-  $('entList').innerHTML = panels.ent.map((it) => rowOf(it)).join('') || '<div class="empty">暂无。点下方 Add，或在正文选中文字按 Delete</div>';
-  $('cnt-man').textContent = count(panels.ent);
-  $('placeList').innerHTML = panels.place.map(chip).join('') || `<span class="empty">${ner.ready() ? '无' : '未载入模型，仅规则识别可用'}</span>`;
-  $('cnt-place').textContent = count(panels.place);
-  $('tagList').innerHTML = panels.tag.map(chip).join('') || '<span class="empty">无</span>';
-  $('cnt-tag').textContent = count(panels.tag);
-  $('candList').innerHTML = panels.cand.map((it) => rowOf(it, `<span class="score">${it.cat === 'ner' ? it.score.toFixed(2) : '0'}</span>`)).join('') || `<div class="empty">${ner.ready() ? '无备选' : '请先载入离线模型'}</div>`;
-  $('cnt-cand').textContent = count(panels.cand);
+  for (const p of PANELS) {
+    const list = panels[p.id];
+    list.sort((a, b) => b.occ.length - a.occ.length || (b.score || 0) - (a.score || 0)); // 次数相同按置信度
+    $(p.id + 'List').innerHTML = list.map(p.item).join('') || `<div class="empty">${p.empty()}</div>`;
+    $('cnt-' + p.id).textContent = list.length ? `${list.filter(isOn).length} OF ${list.length}` : '0'; // 按规则（条目）数，不是匹配数
+  }
   $('sum').textContent = `${sel.length} of ${live.reduce((a, i) => a + i.occ.length, 0)}`;
 }
 // 定位到下一个出现：全部以 #ta 的光标 / 选区为准（无独立状态）——剩余 = 起点 >= 选区末尾 的出现；点一次选中下一个，到头后变「回顶」
@@ -336,9 +371,9 @@ rightEl.addEventListener('click', (e) => {
     edit(() => { setOn(it, false); if (t.trim()) boxAdd(t.trim()); });
     return;
   }
-  const row = e.target.closest('#entList .row');
-  if (row && !e.target.closest('button,input')) { const it = items.get(row.querySelector('input')?.dataset.key); if (it) edit(() => setOn(it, !isOn(it))); return; } // 点行空白处 = 切换开关
-  const b = e.target.closest('.badge'); if (b) { const it = items.get(b.dataset.key); edit(() => setOn(it, !isOn(it))); }
+  // 切换开关：芯片 / 行（含复选框本身，键盘空格也会触发 click）统一在这里；随后 run() 重绘，复选框状态以 isOn 为准
+  const k = e.target.closest('[data-key]');
+  if (k && !e.target.closest('button')) { const it = items.get(k.dataset.key); if (it) edit(() => setOn(it, !isOn(it))); }
 });
 for (const box of [$('rules'), blackEl]) box.addEventListener('click', () => { // 单击（无选区）自动选中整行
   const { value: v, selectionStart: a, selectionEnd: z } = box; if (a !== z) return;
@@ -351,10 +386,6 @@ rightEl.addEventListener('contextmenu', (e) => { // 芯片没有定位按钮：�
   e.preventDefault();
   locT.kind = 'item'; locT.id = it.key;
   locate(it.occ); paintLoc();
-});
-rightEl.addEventListener('change', (e) => {
-  const t = e.target;
-  if (t.type === 'checkbox' && t.dataset.key) { const it = items.get(t.dataset.key); if (it) edit(() => setOn(it, t.checked)); }
 });
 
 for (const box of [$('extraList'), $('openList')]) box.addEventListener('contextmenu', (e) => {
@@ -376,8 +407,9 @@ function rulesFromSelection(s, e) {
     const os = Math.max(s, ls), oe = Math.min(e, le);
     if (oe > os) hits.push({ i, ln, os: os - ls, oe: oe - ls, whole: os <= ls && oe >= le });
   });
-  if (hits.length === 1) { const t = hits[0].ln.slice(hits[0].os, hits[0].oe).trim(); return t ? [t] : []; }
-  for (const h of hits) { if (h.whole) full.push(h.i + 1); else { const t = h.ln.slice(h.os, h.oe).trim(); if (t) out.push(t); } }
+  const word = (h) => unmark(h.ln.slice(h.os, h.oe)).trim(); // 黑名单存纯文字，不带 ** 等标记
+  if (hits.length === 1) { const t = word(hits[0]); return t ? [t] : []; }
+  for (const h of hits) { if (h.whole) full.push(h.i + 1); else { const t = word(h); if (t) out.push(t); } }
   for (let k = 0; k < full.length;) { let j = k; while (full[j + 1] === full[j] + 1) j++; out.unshift(j > k ? `#L${full[k]}~L${full[j]}` : `#L${full[k]}`); k = j + 1; }
   return out;
 }
@@ -482,14 +514,19 @@ $('gallery').addEventListener('click', (e) => {
 
 // ---------- 输出：A →（Ctrl+S）→ A_脱敏.docx；A 与 A_脱敏 →（Ctrl+Enter 审阅面板）→ 修订写入 A ----------
 function status(t) { $('status').textContent = t; }
-function finalMd() { // 对原文应用 黑名单 + 替换规则
+function redactions() { // 黑名单 + 替换规则 → md 区间替换 [{s, e, text}]
+  const md = ta.value;
+  nthMap.clear();
+  return sel.map((x) => ({ s: x.s, e: x.e, text: replOf(x.it, plainOf(md, x.s, x.e)) }));
+}
+function finalMd() { // 预览：对原文应用 黑名单 + 替换规则
   const md = ta.value;
   if (EDITOR) return md;
   let out = '', p = 0;
-  nthMap.clear();
-  for (const x of sel) { out += md.slice(p, x.s) + replOf(x.it, md.slice(x.s, x.e)); p = x.e; }
+  for (const x of redactions()) { out += md.slice(p, x.s) + x.text; p = x.e; }
   return out + md.slice(p);
 }
+const alertList = (title, ws) => { if (ws.length) alert(title + '\n\n' + ws.map((w) => '• ' + w).join('\n')); };
 const outName = () => doc.cur.name.replace(/\.docx$/i, '') + (EDITOR ? '_新版.docx' : '_脱敏.docx');
 const DOCX_TYPE = [{ description: 'Word', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }];
 const write = async (fh, blob) => { const w = await fh.createWritable(); await w.write(blob); await w.close(); };
@@ -506,10 +543,15 @@ async function guarded(fn) {
 const applyAll = () => guarded(async () => {
   const granted = doc.dir ? (await doc.dir.requestPermission?.({ mode: 'readwrite' })) === 'granted' : false; // 需在用户手势内先拿权限
   const dropImages = EDITOR ? [] : doc.images.filter((i) => i.replaceable && !doc.keep.has(i.path)).map((i) => i.path);
-  const { blob, stats } = await exportDocx(doc.buffer, finalMd(), { track: false, dropImages, wipe: !EDITOR && !!state.cats.meta });
+  const d = await DocxProjection.load(doc.buffer);
+  const stats = EDITOR ? d.applyText(ta.value) : d.replace(redactions());
+  d.dropImages(dropImages);
+  if (!EDITOR && state.cats.meta) d.wipe();
+  const { blob, warnings } = await d.save();
   const fh = granted ? await doc.dir.getFileHandle(outName(), { create: true }) : await showSaveFilePicker({ suggestedName: outName(), types: DOCX_TYPE });
   await write(fh, blob);
   doc.outHandle = fh;
+  alertList(`已写入 ${fh.name}，但有以下问题：`, warnings);
   if (EDITOR) return status(`已保存 ${fh.name}：${stats.del} 删 / ${stats.ins} 插` + (stats.skipped ? `，${stats.skipped} 处无法映射` : ''));
   status(`已生成 ${fh.name}：${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · Ctrl ⏎ 可生成审阅修订');
 });
@@ -521,10 +563,13 @@ const reviewToA = () => guarded(async () => {
   if (doc.dir) hB = await doc.dir.getFileHandle(outName()).catch(() => null);
   hB ||= doc.outHandle;
   if (!hB) { status(`未找到 ${outName()}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); [hB] = await showOpenFilePicker({ types: DOCX_TYPE }); }
-  const pb = await parseDocx(await (await hB.getFile()).arrayBuffer());
-  const { blob, stats } = await exportDocx(doc.buffer, pb.md, { track: true, author: 'ss', newMap: pb.map });
+  const b = await DocxProjection.load(await (await hB.getFile()).arrayBuffer());
+  const a = await DocxProjection.load(await (await doc.cur.h.getFile()).arrayBuffer()); // 现读 A：保留打开后在 Word 里做的修改，上次写入的修订载入时已撤掉
+  const stats = a.applyText(b.md, { from: b });
   if (!stats.del && !stats.ins) return status(`${doc.cur.name} 与 ${hB.name} 的文字没有差异，未写入`);
+  const { blob, warnings } = await a.save({ track: true });
   await write(doc.cur.h, blob);
+  alertList(`已写入 ${doc.cur.name}，但有以下问题：`, warnings);
   status(`已把 ${hB.name} 的差异写入 ${doc.cur.name}：${stats.del} 处删除 / ${stats.ins} 处插入` + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · 请在 Word 审阅面板检查后保存');
 });
 $('apply').onclick = applyAll;
@@ -575,7 +620,7 @@ async function openDoc(i) {
   status('读取中…');
   const file = await ent.h.getFile();
   doc.buffer = await file.arrayBuffer(); doc.cur = ent;
-  const p = await parseDocx(doc.buffer);
+  const p = await DocxProjection.load(doc.buffer);
   doc.parsed = p; doc.orig = p.md;
   doc.images.forEach((x) => x.url && URL.revokeObjectURL(x.url));
   doc.images = await listImages(p.zip);
@@ -585,6 +630,7 @@ async function openDoc(i) {
   $('title').textContent = ent.name.replace(/\.docx$/i, '');
   setFileInfo(ent.name, file.size);
   run(); status('已载入 · Ctrl S → _脱敏.docx · Ctrl ⏎ 审阅面板 → A');
+  alertList(`${ent.name}：以下内容没有处理`, p.warnings);
   if (ner.ready()) runNer();
 }
 let nerAbort = null;
@@ -593,8 +639,7 @@ async function runNer() {
   if (!doc.parsed) return;
   nerAbort?.abort(); // 切换文档 / 重新识别时，丢弃上一轮
   const ac = nerAbort = new AbortController();
-  const raw = doc.orig.split('\n');
-  const lines = raw.map((l) => (/^(:::|---|\|[ -|]+$)/.test(l) ? '' : l.replace(/\|/g, ' ').replace(/\*+/g, '')));
+  const lines = nerLines(doc.orig);
   const base = EDITOR ? '纯文本投影编辑器：直接修改文本，Ctrl+S 保存为 原名_新版.docx；右栏只在首次打开和粘贴时识别。' : '已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。';
   $('bannerText').textContent = '离线 NER 识别中…';
   const t0 = performance.now();
@@ -712,7 +757,7 @@ function rulesApi(patch) {
     else if (k === 'REPLACE') $('rules').value = v;
     else if (v === null) delete RULES[k];
     else {
-      const r = (RULES[k] ||= { name: k, cls: 'tag' });
+      const r = (RULES[k] ||= { name: k, cls: 'custom' });
       Object.assign(r, v);
       if (typeof r.re === 'string') r.re = new RegExp(r.re, 'g');
       else if (r.re && !r.re.global) r.re = new RegExp(r.re.source, r.re.flags + 'g');
@@ -743,7 +788,7 @@ if (EDITOR) {
     setTimeout(async () => {
       if (text && ner.ready()) {
         try {
-          const add = await ner.recognize(text.split('\n').map((l) => l.replace(/\|/g, ' ').replace(/\*+/g, '')), () => {}, { onStatus: status });
+          const add = await ner.recognize(nerLines(text), () => {}, { onStatus: status });
           const have = new Set(state.ner.map((n) => n.type + n.text));
           for (const n of add) if (!have.has(n.type + n.text)) state.ner.push(n);
         } catch (err) { console.error(err); status('NER 失败：' + err.message); }
@@ -754,10 +799,11 @@ if (EDITOR) {
 }
 function scanPanels() {
   items = scan(ta.value, state);
+  rankNer();
   live = [...items.values()].filter(listed);
   sel = selection(live, isOn);
   updateCounts(); renderPanels();
 }
 
-window.__di = { ruleNth, rules: rulesApi, openDoc, state, ta, run, ner, parseDocx, exportDocx, computeEdits, doc, boxAdd, edit, undo, redo, finalMd, applyAll, reviewToA, get items() { return items; }, get sel() { return sel; } };
+window.__di = { ruleNth, rules: rulesApi, openDoc, state, ta, run, ner, DocxProjection, doc, boxAdd, edit, undo, redo, finalMd, redactions, applyAll, reviewToA, get items() { return items; }, get sel() { return sel; } };
 run();
