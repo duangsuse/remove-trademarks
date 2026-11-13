@@ -31,5 +31,6 @@ const stripOrtWasmUrl = () => ({
 
 export default defineConfig({
   plugins: [stripOrtWasmUrl(), viteSingleFile(), injectWasm()],
+  worker: { format: 'iife', plugins: () => [stripOrtWasmUrl()] }, // NER 推理线程（内联为 Blob Worker）
   build: { target: 'es2022', chunkSizeWarningLimit: 99999, assetsInlineLimit: 1e9 },
 });

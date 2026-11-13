@@ -34,11 +34,11 @@ export function parseCustom(text) {
 
 // 含姓名的表格：标签格的下一格 / 特殊表格中标签行的下一行
 function tableNames(md, put) {
-  let pos = 0, inSpecial = false, label = false;
+  let pos = 0, inSpecial = false, label = false, ln = 0;
   const strip = (s) => s.replace(/\*+/g, '').replace(/[：:\s]/g, '');
   for (const line of md.split('\n')) {
     const start = pos;
-    pos += line.length + 1;
+    pos += line.length + 1; ln++;
     if (line.startsWith(':::特殊表格')) { inSpecial = true; label = false; continue; }
     if (line === ':::') { inSpecial = false; label = false; continue; }
     if (line.startsWith('| ') && line.endsWith(' |')) {
@@ -52,11 +52,16 @@ function tableNames(md, put) {
       }
     } else if (inSpecial) {
       const t = strip(line);
-      if (label && NAME_VALUE.test(t) && !NAME_STOP.test(t)) { const i = line.indexOf(t); put(t, start + i, start + i + t.length); }
+      if (label && NAME_VALUE.test(t) && !NAME_STOP.test(t)) put(t, start, start + line.length, ln); // 特殊表格 1 格 1 行：按行号删，和章节一样
       label = NAME_LABELS.test(t);
     }
   }
 }
+
+// 模型常见的无效碎片：只剩公司后缀（"限公司"、"技有限公司"）、括号不成对（"中国）有限公司"）
+const SUFFIX_ONLY = /^.{0,1}?(?:股份)?(?:有限责任|有限)?公司$/;
+const ORGISH = new Set(['ORG', 'FAC', 'GPE', 'LOC']), NUM_TYPES = new Set(['DATE', 'MONEY', 'PERCENT']);
+const junkNer = (t) => SUFFIX_ONLY.test(t) || !/[A-Za-z\u4e00-\u9fff]{2}/.test(t) || (t.match(/[（(]/g) || []).length !== (t.match(/[）)]/g) || []).length; // 另：至少要有连续 2 个字母/汉字（过滤 "137"、".0"）
 
 // 返回 Map(key -> {key,text,cat,en,cls,warn,type,grp,score,occ:[[s,e]]})，不受勾选影响（勾选由调用方过滤，便于显示 ({num})）
 export function scan(md, st) {
@@ -70,7 +75,20 @@ export function scan(md, st) {
     r.re.lastIndex = 0;
     for (const m of md.matchAll(r.re)) {
       if (r.check && !r.check(m[0])) continue;
-      put(id + ':' + m[0], m[0], { cat: id, en: r.en, cls: r.cls, warn: r.warn }, m.index, m.index + m[0].length);
+      const k = r.lead ? r.lead(m[0]) : 0, text = m[0].slice(k), at = m.index + k;
+      put(id + ':' + text, text, { cat: id, en: r.en, cls: r.cls, warn: r.warn }, at, at + text.length);
+    }
+  }
+  // 「…开发联合南通东华软件有限公司」：联合/合作 可能是名称本身的一部分，所以只有当后半段本身就是文中另一处识别出的公司全称（>=8 字）时才截
+  const names = new Set([...items.values()].filter((it) => it.cat === 'company').map((it) => it.text));
+  for (const it of [...items.values()]) {
+    if (it.cat !== 'company') continue;
+    for (const m of it.text.matchAll(/联合|合作|与|和|及/g)) {
+      const rest = it.text.slice(m.index + m[0].length);
+      if (m.index < 2 || rest.length < 8 || !names.has(rest)) continue;
+      items.delete(it.key);
+      for (const [s, e] of it.occ) put('company:' + rest, rest, { cat: 'company', en: it.en, cls: it.cls, warn: it.warn }, e - rest.length, e);
+      break;
     }
   }
   for (const c of st.custom) {
@@ -92,12 +110,45 @@ export function scan(md, st) {
   const abbr = new Set();
   for (const m of md.matchAll(ABBR_RE)) abbr.add(m[1]);
   for (const w of abbr) findAll(md, w, (s, e) => put('abbr:' + w, w, { cat: 'abbr', en: 'abbr', cls: 'tag' }, s, e));
-  tableNames(md, (t, s, e) => put('tbl:' + t, t, { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true }, s, e));
-  for (const n of st.ner) {
+  tableNames(md, (t, s, e, ln) => (ln
+    ? put('tbl:#L' + ln, '#L' + ln, { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true, del: true, show: t }, s, e)
+    : put('tbl:' + t, t, { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true }, s, e)));
+  // 模型只做兜底召回：规则 / 黑名单已识别的公司、地址里的碎片（"件有限公司"、"东华软"）不再重复列出
+  const anchors = [...items.values()].filter((it) => it.cat === 'company' || it.cat === 'addr' || it.cat === 'black').map((it) => it.text);
+  const cats = st.cats || {}, minScore = st.nerMin || 0, nerAll = st.ner.filter((n) => n.score >= minScore);
+  // NER 校验正则：公司／地址正则命中处没有任何 机构/设施/地名 实体与之重叠 → 标成存疑（warn，默认不选）
+  if (cats.ner_verify) {
+    const orgish = nerAll.filter((n) => ORGISH.has(n.type));
+    const ovl = (it) => orgish.some((n) => n.text.includes(it.text) || it.text.includes(n.text));
+    for (const it of items.values()) if ((it.cat === 'company' || it.cat === 'addr') && !ovl(it)) { it.warn = true; it.cls = 'warn'; it.weak = true; }
+  }
+  // NER 人名放大：张三丰 → 张总 / 张工 / 小张 / 老张 …（同姓的称呼也一并标出）
+  if (cats.ner_alias) {
+    for (const n of nerAll) {
+      if (n.type !== 'PERSON' || n.text.length < 2 || n.text.length > 4 || /[^\u4e00-\u9fff]/.test(n.text)) continue;
+      const sn = n.text[0], re = new RegExp(`(?:[小老]${sn}(?![\u4e00-\u9fff])|${sn}(?:总|工|老师|经理|主任|博士|教授|局长|处长|董事长|先生|女士|书记|院长|所长|部长))`, 'g');
+      for (const m of md.matchAll(re)) {
+        if (items.has('ner:' + m[0])) continue;
+        put('ner:' + m[0], m[0], { cat: 'ner', en: 'ner_person', cls: 'person', type: 'PERSON', grp: 'person', score: n.score, alias: true }, m.index, m.index + m[0].length);
+      }
+    }
+  }
+  // NER 日期/数量/金额：补正则漏掉的（已被其他条目包含的不再列）
+  if (cats.ner_num) {
+    const have = [...items.values()].map((it) => it.text);
+    for (const n of nerAll) {
+      if (!NUM_TYPES.has(n.type) || n.text.length < 2 || !/[0-9０-９一二三四五六七八九十百千万亿零〇]/.test(n.text)) continue;
+      const key = 'ner:' + n.text;
+      if (items.has(key) || have.some((h) => h.includes(n.text))) continue;
+      findAll(md, n.text, (s, e) => put(key, n.text, { cat: 'ner', en: 'ner_num', cls: 'cand', type: n.type, grp: 'cand', score: n.score }, s, e));
+    }
+  }
+  for (const n of nerAll) {
     const grp = NER_GROUPS[n.type];
     if (!grp || /[*|\n\\]/.test(n.text) || n.text.length < 2) continue;
     const key = 'ner:' + n.text;
     if (items.has('bl:' + n.text) || items.has(key)) continue;
+    if (junkNer(n.text) || anchors.some((a) => a.includes(n.text))) continue;
     const abbr = grp === 'cand' && [...n.text].length <= ABBR_MAX; // 机构/产品类 <=3 字算简称
     findAll(md, n.text, (s, e) => put(key, n.text, { cat: 'ner', en: abbr ? 'abbr' : 'ner_' + grp, cls: abbr ? 'tag' : grp, type: n.type, grp: abbr ? 'abbr' : grp, score: n.score }, s, e));
   }
@@ -110,16 +161,30 @@ export function parseRules(text) {
   for (const ln of text.split('\n')) {
     const i = ln.indexOf('=>');
     if (i < 0) continue;
-    const re = ln.slice(0, i).trim(), rep = ln.slice(i + 2).trim();
+    let re = ln.slice(0, i).trim();
+    const rep = ln.slice(i + 2).trim(), pre = /^::([^:]+)::\s*/.exec(re); // ::cname:: 前缀：只作用于该类别（cat / en / NER 类型）
+    if (pre) re = re.slice(pre[0].length);
     if (!re) continue;
-    try { rules.push({ test: new RegExp('^(?:' + re + ')$'), re: new RegExp(re, 'g'), rep }); } catch { /* 忽略无效规则 */ }
+    try { rules.push({ test: new RegExp('^(?:' + re + ')$'), re: new RegExp(re, 'g'), rep, only: pre ? pre[1].trim() : '' }); } catch { /* 忽略无效规则 */ }
   }
   return rules;
 }
 
-export function replacement(text, ovr, rules) {
+// 替换模板：{表达式} 以 s（命中文本本身）、$m（正则匹配数组，$m[0] 为整段，$m[1] 为第 1 组）、kind（类别显示名）为变量求值，如 {s[0]}姓人员、{kind}{__di.ruleNth(kind, s)}；另支持 $1
+function expand(rep, m, kind) {
+  const s = m[0];
+  return rep.replace(/\{([^{}]+)\}/g, (all, expr) => {
+    try { return String(new Function('s', '$m', 'kind', '__di', `return (${expr})`)(s, m, kind, globalThis.__di)); } catch { return all; }
+  }).replace(/\$(\d)/g, (_, k) => m[+k] ?? '');
+}
+export function replacement(text, ovr, rules, ctx = { names: [], kind: '' }) {
   if (ovr !== undefined && ovr !== '') return ovr === '∅' ? '' : ovr;
-  for (const r of rules) if (r.test.test(text)) { r.re.lastIndex = 0; return text.replace(r.re, r.rep); }
+  for (const r of rules) {
+    if (r.only && !ctx.names.includes(r.only)) continue;
+    if (!r.test.test(text)) continue;
+    r.re.lastIndex = 0;
+    return text.replace(r.re, (...a) => (a[0] === '' ? '' : expand(r.rep, a.slice(0, a.findIndex((x) => typeof x === 'number')), ctx.kind))); // 空匹配（.* 在末尾多匹配一次）不展开
+  }
   return '**';
 }
 

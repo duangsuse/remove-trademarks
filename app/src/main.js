@@ -1,7 +1,7 @@
 import './style.css';
 import { parseDocx, computeEdits, exportDocx, listImages } from './docx.js';
 import { scan, parseRules, parseCustom, parseBlackLines, replacement, selection, chapters } from './detect.js';
-import { MAIN, EXTRA, TOOLS, TYPE_NAME, DEFAULT_REPLACE_RULES, HIDE_WHEN_OFF, TAG_CATS, ENT_CATS, TITLE_RE, ABBR_MAX, RULES, FINGERPRINT_URL } from './rules.js';
+import { MAIN, EXTRA, TOOLS, TYPE_NAME, DEFAULT_REPLACE_RULES, HIDE_WHEN_OFF, TAG_CATS, ENT_CATS, TITLE_RE, ABBR_MAX, RULES, FINGERPRINT_URL, ABBR_RE, NAME_LABELS, NAME_VALUE } from './rules.js';
 import * as ner from './ner.js';
 
 const $ = (id) => document.getElementById(id);
@@ -14,30 +14,72 @@ const root = document.documentElement;
 root.dataset.theme = store.get('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 $('logo').onclick = () => { root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark'; store.set('theme', root.dataset.theme); };
 
+// URL 带 #editor：关闭脱敏功能，当作纯文本投影编辑器（Ctrl+S → _新版.docx）；左栏只剩章节，右栏仅在粘贴时更新
+const EDITOR = location.hash === '#editor';
+addEventListener('hashchange', () => location.reload());
+document.body.classList.toggle('ed', EDITOR);
+
 // ---------- 状态 ----------
 // 脱敏的唯一来源是左栏两个大框：黑名单（词 / 行号 #L11~L222）与「删除时（替换）规则」。
 // 右侧面板、正文里的删除只是在编辑这两个框；正文 #ta 只读。
-const state = { cats: { custom: true }, tools: {}, blacklist: [], ranges: [], custom: [], ner: [], on: {} };
+const state = { cats: { custom: true }, tools: {}, blacklist: [], ranges: [], custom: [], ner: [], on: {}, nerMin: 0.5 };
 for (const x of [...MAIN, ...EXTRA]) state.cats[x.id] = x.def !== false;
 for (const t of TOOLS) state[t.scope][t.id] = t.def;
 const doc = { entries: [], dir: null, cur: null, buffer: null, parsed: null, orig: '', images: [], order: [], keep: new Set(), outHandle: null };
 let pendingModel = null;
 
+const SPECIAL_CODE = {
+  img: '图片：替换为 1×1 占位图（勾选缩略图可保留）', meta: '.docx 不可见指纹抹除：作者/公司属性、缩略图、批注、修订记录、隐藏文字、rsid/paraId 等',
+  black: '黑名单词汇：左栏黑名单框的词 / #L行号 规则', abbr: () => `以下简称“…” → ${ABBR_RE}`,
+  tblname: () => `标签格：${NAME_LABELS}\n姓名值：${NAME_VALUE}\n特殊表格中按行号删除`,
+  ner_person: '离线 NER：PERSON', ner_place: '离线 NER：GPE / LOC', ner_cand: '离线 NER：ORG / FAC / PRODUCT / NORP（> 3 字）',
+  ner_verify: '公司／地址正则命中处，若没有任何 NER 的 ORG / FAC / GPE / LOC 实体与之重叠 → 标为存疑（红，默认不选）',
+  ner_alias: '对 NER 识别出的人名（姓 X）额外标出 X总 / X工 / X老师 / X经理… / 小X / 老X',
+  ner_num: '离线 NER：DATE / MONEY / PERCENT（含数字，正则已覆盖的不再列）',
+};
+function ruleCode(id) { // 悬停预览：该开关背后的规则代码
+  const lines = Object.entries(RULES).filter(([, r]) => r.en === id).map(([k, r]) => `${k}: ${r.re}`);
+  const sp = SPECIAL_CODE[id];
+  if (sp) lines.push(typeof sp === 'function' ? sp() : sp);
+  return lines.join('\n') || id;
+}
 const row = (x, scope) => {
   const tail = x.info ? `<a class="info" href="${FINGERPRINT_URL}" target="_blank" rel="noopener" title="微软：删除隐藏数据和个人信息">ⓘ</a>`
     : scope === 'cats' && !TOOLS.some((t) => t.id === x.id) ? `<span class="n" data-n="${x.id}"></span>` : '';
-  return `<label><input type="checkbox" data-s="${scope}" data-k="${x.id}" ${state[scope][x.id] ? 'checked' : ''}><span>${x.name}${tail}${x.note ? ` <span class="n">- ${x.note}</span>` : ''}</span></label>`;
+  return `<label title="${esc(ruleCode(x.id))}"><input type="checkbox" data-s="${scope}" data-k="${x.id}" ${state[scope][x.id] ? 'checked' : ''}><span>${x.name}${tail}${x.note ? ` <span class="n">- ${x.note}</span>` : ''}</span></label>`;
 };
-$('catList').innerHTML = MAIN.map((x) => row(x, 'cats')).join('');
-$('extraList').innerHTML = EXTRA.map((x) => row(x, 'cats')).join('');
-$('moreN').textContent = `(${EXTRA.length})`;
-$('toolList').innerHTML = TOOLS.map((t) => row(t, t.scope)).join('');
+const OPEN_ORDER = ['company', 'patent', 'cname', 'contact'];
+function renderLeft() {
+  const rest = EXTRA.filter((x) => !x.grp);
+  $('catList').innerHTML = MAIN.filter((x) => !x.grp).map((x) => row(x, 'cats')).join('');
+  $('openList').innerHTML = [...MAIN, ...EXTRA].filter((x) => x.grp === 'open').sort((a, b) => OPEN_ORDER.indexOf(a.id) - OPEN_ORDER.indexOf(b.id)).map((x) => row(x, 'cats')).join('');
+  $('extraList').innerHTML = rest.map((x) => row(x, 'cats')).join('');
+  $('moreN').textContent = `(${rest.length})`;
+  $('toolList').innerHTML = TOOLS.map((t) => row(t, t.scope)).join('') +
+    `<label title="低于该置信度的 NER 结果不进右栏"><span>NER 置信度 ≥ <b id="nerMinV" class="mono">${state.nerMin.toFixed(2)}</b></span><input id="nerMin" type="range" min="0" max="0.99" step="0.01" value="${state.nerMin}" style="appearance:auto;width:90px;height:auto;border:0;border-radius:0"></label>`;
+}
+renderLeft();
 $('rules').value = DEFAULT_REPLACE_RULES;
 
+document.addEventListener('input', (e) => {
+  if (e.target.id !== 'nerMin') return;
+  state.nerMin = +e.target.value; $('nerMinV').textContent = state.nerMin.toFixed(2);
+  clearTimeout(tmMin);
+  tmMin = setTimeout(() => { // 重新过滤：低于阈值而不再出现的 NER 条目，连同黑名单框里自动同步的行一并去掉
+    run();
+    for (const [k, m] of memo) if (m.ner && !items.has(k)) { memo.delete(k); delete state.on[k]; }
+    syncBlack();
+  }, 150);
+});
+let tmMin = 0;
 document.addEventListener('change', (e) => {
   const t = e.target, k = t.dataset?.k;
   if (!k) return;
   state[t.dataset.s][k] = t.checked;
+  if (t.dataset.s === 'cats') { // 左栏只是右栏的开关：同类条目一并勾选 / 取消
+    for (const [key, m] of memo) if (m.en === k) state.on[key] = t.checked;
+    for (const it of items.values()) if (it.en === k && it.cat !== 'black') state.on[it.key] = t.checked;
+  }
   if (k === 'img') resetKeep();
   refresh(true);
 });
@@ -45,11 +87,11 @@ document.addEventListener('change', (e) => {
 // ---------- 黑名单框：=== 以上手填，以下随右侧面板同步 ----------
 const SEP = '===', blackEl = $('black');
 let lastGen = new Set();
-const base = (it) => !(it.cat === 'ner' && it.grp === 'cand'); // 机构/产品候选（>3 字）默认不选
+const base = (it) => !(it.cat === 'ner' && it.grp === 'cand' && it.en !== 'ner_num') && !it.weak; // 机构/产品候选（>3 字）默认不选
 const memo = new Map(); // key -> {text,en,base}：见过的条目；文中不再出现（比如已脱敏）也保留，黑名单框不随文本变化
 const memoOn = (key, m) => (key in state.on ? state.on[key] : !!state.cats[m.en] && m.base);
 function remember() {
-  for (const it of items.values()) if (it.cat !== 'black') memo.set(it.key, { text: it.text, en: it.en, base: base(it) });
+  for (const it of items.values()) if (it.cat !== 'black') memo.set(it.key, { text: it.text, en: it.en, base: base(it), ner: it.cat === 'ner' });
 }
 const splitBlack = () => {
   const lines = blackEl.value.split('\n'), i = lines.findIndex((l) => l.trim() === SEP);
@@ -131,7 +173,41 @@ blackEl.addEventListener('beforeinput', () => checkpoint(false));
 $('rules').addEventListener('beforeinput', () => checkpoint(false));
 
 // ---------- 识别 / 渲染 ----------
-const ta = $('ta'), hl = $('hl');
+const ta = $('ta');
+// #ta 是只读 div（#editor 模式为 plaintext-only 可编辑），下面补上 textarea 的 value / selectionStart / End / setSelectionRange，其余代码不用改
+let lastSel = [0, 0];
+const offOf = (node, off) => { const r = document.createRange(); r.setStart(ta, 0); r.setEnd(node, off); return r.toString().length; };
+function syncSel() {
+  const g = getSelection();
+  if (g.rangeCount && ta.contains(g.anchorNode) && ta.contains(g.focusNode)) { const r = g.getRangeAt(0); lastSel = [offOf(r.startContainer, r.startOffset), offOf(r.endContainer, r.endOffset)]; }
+}
+document.addEventListener('selectionchange', syncSel);
+function nodeAt(off) {
+  const w = document.createTreeWalker(ta, NodeFilter.SHOW_TEXT);
+  let n, acc = 0, last = null;
+  while ((n = w.nextNode())) { last = n; if (off <= acc + n.length) return [n, off - acc]; acc += n.length; }
+  return last ? [last, last.length] : [ta, 0];
+}
+function rangeOf(s, e) { const r = document.createRange(); r.setStart(...nodeAt(s)); r.setEnd(...nodeAt(e)); return r; }
+Object.defineProperties(ta, {
+  value: { get: () => ta.textContent, set: (v) => { ta.textContent = v; lastSel = [0, 0]; } },
+  selectionStart: { get: () => lastSel[0] },
+  selectionEnd: { get: () => lastSel[1] },
+});
+ta.setSelectionRange = (s, e) => { const g = getSelection(); g.removeAllRanges(); g.addRange(rangeOf(s, e)); lastSel = [s, e]; };
+// 高亮：每个类别一个 Highlight（样式见 ::highlight(...)）；未选中（不会被打码）的统一用 off（下划线）
+function paintHighlights(occ) {
+  CSS.highlights.clear();
+  const by = {};
+  let p = 0;
+  for (const o of occ.sort((a, b) => a.s - b.s || b.e - a.e)) {
+    if (o.s < p) continue;
+    p = o.e;
+    const k = isOn(o.it) ? cls(o.it) : 'off';
+    (by[k] ||= new Highlight()).add(rangeOf(o.s, o.e));
+  }
+  for (const k in by) CSS.highlights.set(k, by[k]);
+}
 let items = new Map(), live = [], sel = [], tm = 0, chs = [];
 const enabled = (it) => !!state.cats[it.en];
 const listed = (it) => enabled(it) || !HIDE_WHEN_OFF.has(it.en);
@@ -141,6 +217,7 @@ const cls = (it) => (it.warn || TITLE_RE.test(it.text) ? 'warn' : it.cls); // �
 function refresh(now) { clearTimeout(tm); tm = setTimeout(run, now ? 0 : 160); }
 function run() {
   clearTimeout(tm);
+  if (EDITOR) { renderChapters(); return; } // 编辑器模式：只维护章节
   readHead();
   const md = ta.value;
   items = scan(md, state);
@@ -149,14 +226,7 @@ function run() {
   const occ = [];
   for (const it of live) for (const [s, e] of it.occ) occ.push({ s, e, it });
   occ.sort((a, b) => a.s - b.s || b.e - a.e);
-  let html = '', p = 0;
-  for (const o of occ) {
-    if (o.s < p) continue;
-    html += esc(md.slice(p, o.s)) + `<mark class="${cls(o.it)} ${isOn(o.it) ? '' : 'off'}">${esc(md.slice(o.s, o.e))}</mark>`;
-    p = o.e;
-  }
-  hl.innerHTML = html + esc(md.slice(p)) + '\n ';
-  hl.scrollTop = ta.scrollTop;
+  paintHighlights(occ);
   updateCounts();
   renderPanels();
   renderChapters();
@@ -164,16 +234,26 @@ function run() {
   syncBlack();
   updatePill();
 }
-ta.addEventListener('scroll', () => { hl.scrollTop = ta.scrollTop; });
 
 const rules = () => parseRules($('rules').value);
-const replOf = (it, text) => (it.del ? '' : replacement(text, undefined, rules()));
+const nthMap = new Map();
+const ruleNth = (kind, s) => { // 同类（kind）内按首次出现顺序编号，同一文本编号相同
+  const key = Array.isArray(s) ? s[0] : String(s);
+  if (!nthMap.has(kind)) nthMap.set(kind, new Map());
+  const m = nthMap.get(kind);
+  if (!m.has(key)) m.set(key, m.size + 1);
+  return m.get(key);
+};
+const replOf = (it, text) => (it.del ? '' : replacement(text, undefined, rules(), { names: [it.cat, it.en, it.type], kind: kindOf(it) }));
 
 function updateCounts() {
   const cnt = {};
   for (const it of items.values()) cnt[it.en] = (cnt[it.en] || 0) + 1;
   cnt.img = doc.images.length;
-  for (const el of document.querySelectorAll('[data-n]')) el.textContent = ` (${cnt[el.dataset.n] || 0})`;
+  ruleOccs = {};
+  for (const x of [...MAIN, ...EXTRA]) if (x.grp || EXTRA.includes(x)) ruleOccs[x.id] = ruleOcc(x.id);
+  for (const el of document.querySelectorAll('[data-n]')) if (!ruleOccs[el.dataset.n]) el.textContent = ` (${cnt[el.dataset.n] || 0})`;
+  paintLoc();
 }
 
 // 面板归属：实体清单(ent) / 人名地名(place) / 简称·电话·专利号(tag) / 自动识别(cand，规则类置信度 0)
@@ -186,14 +266,14 @@ function panelOf(it) {
   return 'cand';
 }
 const panels = { ent: [], place: [], tag: [], cand: [] };
-const chip = (it) => `<span class="badge ${cls(it)} ${isOn(it) ? '' : 'off'}" data-key="${esc(it.key)}">${esc(it.text)}<small>${it.occ.length}</small></span>`;
-const kindOf = (it) => (it.cat === 'black' ? (it.del ? '行号' : '手动') : it.cat === 'ner' ? TYPE_NAME[it.type] || it.type : RULES[it.cat]?.name || it.label || '规则');
-const rowOf = (it, extra = '') => `<div class="row"><input type="checkbox" data-key="${esc(it.key)}" ${isOn(it) ? 'checked' : ''}><div class="t">${esc(it.text)}<small>${kindOf(it)} · ${it.occ.length}次</small></div>${extra}${locBtn(it)}<button class="ren" data-ren="${esc(it.key)}" title="重命名（留空即删除）">✎</button></div>`;
+const chip = (it) => `<span class="badge ${cls(it)} ${isOn(it) ? 'on' : 'off'}" data-key="${esc(it.key)}" title="${esc(it.text)}">${esc(it.show || it.text)}<small>${it.occ.length}</small></span>`;
+const kindOf = (it) => (it.cat === 'tblname' && it.del ? '含姓名表格 · 行号' : it.cat === 'black' ? (it.del ? '行号' : '手动') : it.cat === 'ner' ? TYPE_NAME[it.type] || it.type : RULES[it.cat]?.name || it.label || '规则');
+const rowOf = (it, extra = '') => `<div class="row ${isOn(it) ? 'on' : ''}"><input type="checkbox" data-key="${esc(it.key)}" ${isOn(it) ? 'checked' : ''}><div class="t">${esc(it.show ? it.show + ' ' : '')}${esc(it.text)}<small>${kindOf(it)} · ${it.occ.length}次</small></div>${extra}${locBtn(it)}<button class="ren" data-ren="${esc(it.key)}" title="重命名（留空即删除）">✎</button></div>`;
 function renderPanels() {
   for (const k in panels) panels[k] = [];
   for (const it of live) panels[panelOf(it)].push(it);
   panels.cand.sort((a, b) => (b.score || 0) - (a.score || 0) || b.occ.length - a.occ.length);
-  const count = (list) => { if (!list.length) return '0'; const t = list.reduce((a, i) => a + i.occ.length, 0), o = list.filter(isOn).reduce((a, i) => a + i.occ.length, 0); return `${o} OF ${t}`; };
+  const count = (list) => (list.length ? `${list.filter(isOn).length} OF ${list.length}` : '0'); // 按规则（条目）数，不是匹配数
   $('entList').innerHTML = panels.ent.map((it) => rowOf(it)).join('') || '<div class="empty">暂无。点下方 Add，或在正文选中文字按 Delete</div>';
   $('cnt-man').textContent = count(panels.ent);
   $('placeList').innerHTML = panels.place.map(chip).join('') || `<span class="empty">${ner.ready() ? '无' : '未载入模型，仅规则识别可用'}</span>`;
@@ -204,29 +284,50 @@ function renderPanels() {
   $('cnt-cand').textContent = count(panels.cand);
   $('sum').textContent = `${sel.length} of ${live.reduce((a, i) => a + i.occ.length, 0)}`;
 }
-// 定位到下一个出现：剩 N ↓ ；到头后变「回顶 ↥」
-const visited = {};
-const remaining = (it) => it.occ.filter((o) => o[0] > (visited[it.key] ?? -1)).length;
-const locBtn = (it) => {
-  if (!it.occ.length) return '<button class="loc" disabled>—</button>';
-  const n = remaining(it);
-  return `<button class="loc" data-loc="${esc(it.key)}" title="${n ? '定位到下一个出现' : '回到文首'}">${n ? `剩${n} ↓` : '回顶 ↥'}</button>`;
-};
-function gotoOcc(s, e) {
+// 定位到下一个出现：全部以 #ta 的光标 / 选区为准（无独立状态）——剩余 = 起点 >= 选区末尾 的出现；点一次选中下一个，到头后变「回顶」
+const caret = () => ta.selectionEnd;
+const remainOf = (occ) => occ.filter((o) => o[0] >= caret()).length;
+// 全局只有一个查找目标 locT：点 / 右键只是把它挪到鼠标下临时显示 (剩N / 回顶)；其余位置一律显示总数
+const locT = { kind: '', id: '' };
+const isT = (kind, id) => locT.kind === kind && locT.id === id;
+const locLabel = (it) => { if (!isT('item', it.key)) return `${it.occ.length} ↓`; const n = remainOf(it.occ); return n ? `剩${n} ↓` : '回首 ↥'; };
+const locBtn = (it) => (it.occ.length ? `<button class="loc" data-loc="${esc(it.key)}" title="定位到下一个出现（到头后回第一处）">${locLabel(it)}</button>` : '<button class="loc" disabled>—</button>');
+function gotoOcc(s, e, smooth) {
   ta.focus(); ta.setSelectionRange(s, e);
-  ta.scrollTop = Math.max(0, yOf(s) - 80);
+  const top = rangeOf(s, Math.max(e, s + 1)).getBoundingClientRect().top - ta.getBoundingClientRect().top + ta.scrollTop;
+  ta.scrollTo({ top: Math.max(0, top - ta.clientHeight / 3), behavior: smooth ? 'smooth' : 'auto' });
 }
+let lastTarget = '';
+function locate(occ) { // 平滑滚动只在切换查找目标时用；同一目标连着点则直接跳
+  const sig = locT.kind + locT.id, smooth = sig !== lastTarget;
+  lastTarget = sig;
+  const o = occ.find((x) => x[0] >= caret()) || occ[0]; // 到头后回第一处出现（不是文档顶）；无出现则无操作
+  if (o) gotoOcc(o[0], o[1], smooth);
+}
+// 右键查找的目标：芯片面板 → 最近右键的那一项；「更多规则」→ 被右键过的规则。尾部显示 (剩N) / (回首)
+let ruleOccs = {};
+function ruleOcc(en) { // 更多规则在右栏已过滤的文本上运行：被其他类别已选中（将被打码）的位置不再计入
+  const others = sel.filter((x) => x.it.en !== en), out = [];
+  for (const it of items.values()) if (it.en === en) for (const o of it.occ) if (!others.some((x) => x.s < o[1] && o[0] < x.e)) out.push(o);
+  return out.sort((a, b) => a[0] - b[0]);
+}
+const tail = (occ) => { const n = remainOf(occ); return n ? `(剩${n})` : '(回首)'; };
+let paintRaf = 0;
+function paintLoc() {
+  for (const b of document.querySelectorAll('[data-loc]')) { const it = items.get(b.dataset.loc); if (it) b.textContent = locLabel(it); }
+  const cur = locT.kind === 'item' ? items.get(locT.id) : null;
+  for (const el of document.querySelectorAll('[data-lp]')) el.textContent = cur && panelOf(cur) === el.dataset.lp ? tail(cur.occ) : '';
+  for (const x of [...MAIN, ...EXTRA]) { if (!ruleOccs[x.id]) continue; const el = document.querySelector(`[data-n="${x.id}"]`); if (el) el.textContent = ' ' + (isT('rule', x.id) ? tail(ruleOccs[x.id] || []) : `(${(ruleOccs[x.id] || []).length})`); }
+}
+document.addEventListener('selectionchange', () => { cancelAnimationFrame(paintRaf); paintRaf = requestAnimationFrame(paintLoc); });
 const rightEl = document.querySelector('.right');
 rightEl.addEventListener('click', (e) => {
   const all = e.target.closest('[data-all]');
   if (all) { const list = panels[all.dataset.all]; if (list.length) { const to = !list.every(isOn); edit(() => list.forEach((it) => setOn(it, to))); } return; }
   const l = e.target.closest('[data-loc]');
-  if (l) {
-    const it = items.get(l.dataset.loc); if (!it) return;
-    const o = it.occ.find((x) => x[0] > (visited[it.key] ?? -1));
-    if (o) { visited[it.key] = o[0]; gotoOcc(o[0], o[1]); } else { visited[it.key] = -1; ta.scrollTop = 0; ta.setSelectionRange(0, 0); hl.scrollTop = 0; }
-    renderPanels(); return;
-  }
+  if (l) { const it = items.get(l.dataset.loc); if (it) { locT.kind = 'item'; locT.id = it.key; locate(it.occ); paintLoc(); } return; }
+  const lp = e.target.closest('[data-lp]');
+  if (lp) { const it = locT.kind === 'item' ? items.get(locT.id) : null; if (it && panelOf(it) === lp.dataset.lp) { locate(it.occ); paintLoc(); } return; }
   const r = e.target.closest('[data-ren]');
   if (r) {
     const it = items.get(r.dataset.ren); if (!it) return;
@@ -235,14 +336,36 @@ rightEl.addEventListener('click', (e) => {
     edit(() => { setOn(it, false); if (t.trim()) boxAdd(t.trim()); });
     return;
   }
+  const row = e.target.closest('#entList .row');
+  if (row && !e.target.closest('button,input')) { const it = items.get(row.querySelector('input')?.dataset.key); if (it) edit(() => setOn(it, !isOn(it))); return; } // 点行空白处 = 切换开关
   const b = e.target.closest('.badge'); if (b) { const it = items.get(b.dataset.key); edit(() => setOn(it, !isOn(it))); }
+});
+for (const box of [$('rules'), blackEl]) box.addEventListener('click', () => { // 单击（无选区）自动选中整行
+  const { value: v, selectionStart: a, selectionEnd: z } = box; if (a !== z) return;
+  const s = v.lastIndexOf('\n', a - 1) + 1, e = v.indexOf('\n', a);
+  box.setSelectionRange(s, e < 0 ? v.length : e);
+});
+rightEl.addEventListener('contextmenu', (e) => { // 芯片没有定位按钮：右键查找下一个，(剩/回顶) 显示在面板名尾部
+  const b = e.target.closest('.badge'); if (!b) return;
+  const it = items.get(b.dataset.key); if (!it) return;
+  e.preventDefault();
+  locT.kind = 'item'; locT.id = it.key;
+  locate(it.occ); paintLoc();
 });
 rightEl.addEventListener('change', (e) => {
   const t = e.target;
   if (t.type === 'checkbox' && t.dataset.key) { const it = items.get(t.dataset.key); if (it) edit(() => setOn(it, t.checked)); }
 });
 
-// ---------- 正文只读：选中后删除 / 拖选 / 点高亮 = 往黑名单加规则 ----------
+for (const box of [$('extraList'), $('openList')]) box.addEventListener('contextmenu', (e) => {
+  const inp = e.target.closest('label')?.querySelector('input'); if (!inp) return;
+  e.preventDefault();
+  const en = inp.dataset.k;
+  ruleOccs[en] = ruleOcc(en); locT.kind = 'rule'; locT.id = en;
+  locate(ruleOccs[en]); paintLoc();
+});
+
+// ---------- 正文只读：选中后删除 / 拖选 = 往黑名单加规则 ----------
 // 多行选择：整行用行号模式 #L11~L22，行内片段用词；单行选择一律用词
 function rulesFromSelection(s, e) {
   const lines = ta.value.split('\n'), out = [], full = [];
@@ -259,6 +382,7 @@ function rulesFromSelection(s, e) {
   return out;
 }
 function addFromSelection() {
+  if (EDITOR) return false;
   const s = ta.selectionStart, e = ta.selectionEnd;
   if (e <= s) return false;
   const rs = rulesFromSelection(s, e);
@@ -269,19 +393,16 @@ function addFromSelection() {
   return true;
 }
 ta.addEventListener('keydown', (e) => {
-  if ((e.key === 'Backspace' || e.key === 'Delete') && ta.selectionEnd > ta.selectionStart) { e.preventDefault(); addFromSelection(); }
+  if (!EDITOR && (e.key === 'Backspace' || e.key === 'Delete') && ta.selectionEnd > ta.selectionStart) { e.preventDefault(); addFromSelection(); }
 });
 ta.addEventListener('cut', () => { addFromSelection(); });
 ta.addEventListener('mouseup', () => {
-  const s = ta.selectionStart, e = ta.selectionEnd;
-  if (e > s) { if (state.tools.drag) addFromSelection(); return; }
-  if (!state.tools.click) return;
-  for (const it of live) for (const [os, oe] of it.occ) if (s >= os && s < oe) {
-    if (isOn(it)) { status(`「${it.text.slice(0, 20)}」已在黑名单`); return; }
-    edit(() => { if (it.cat === 'black') return; boxAdd(it.text); });
-    status(`已加入黑名单：${it.text.slice(0, 24)}`);
-    return;
-  }
+  if (EDITOR || !state.tools.drag) return;
+  syncSel();
+  if (ta.selectionEnd > ta.selectionStart) addFromSelection();
+});
+ta.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); ta.setSelectionRange(0, ta.value.length); }
 });
 
 $('addMan').onclick = () => {
@@ -300,33 +421,20 @@ $('addMan').onclick = () => {
 $('addMan').onmousedown = (e) => e.preventDefault(); // 点按钮不让文本框失去选区
 
 // ---------- 章节悬浮框：左键跳转，右键整章删除 ----------
-function yOf(pos) {
-  const w = document.createTreeWalker(hl, NodeFilter.SHOW_TEXT);
-  let n, acc = 0;
-  while ((n = w.nextNode())) {
-    const l = n.nodeValue.length;
-    if (pos <= acc + l) {
-      const r = document.createRange(), o = pos - acc;
-      r.setStart(n, Math.min(o, l)); r.setEnd(n, Math.min(o + 1, l));
-      return r.getBoundingClientRect().top - hl.getBoundingClientRect().top + hl.scrollTop;
-    }
-    acc += l;
-  }
-  return 0;
-}
 function renderChapters() {
   const box = $('chapters');
-  box.hidden = !state.tools.chapter;
-  if (!state.tools.chapter) return;
+  box.hidden = !EDITOR && !state.tools.chapter;
+  if (box.hidden) return;
   chs = chapters(ta.value);
   const min = chs.reduce((a, c) => Math.min(a, c.level), 9);
-  box.innerHTML = `<div class="ch-h">章节 ${chs.length} · 左键跳转 · 右键整章加入黑名单</div>` + (chs.map((c, i) => `<div class="ch" data-i="${i}" style="padding-left:${6 + (c.level - min) * 12}px" title="${esc(c.title)}">${esc(c.title)}</div>`).join('') || '<div class="empty" style="padding:4px 6px">未识别到章节</div>');
+  box.innerHTML = `<div class="ch-h">章节 ${chs.length} · ${EDITOR ? '点击跳转' : '左键跳转 · 右键整章加入黑名单'}</div>` + (chs.map((c, i) => `<div class="ch" data-i="${i}" style="padding-left:${6 + (c.level - min) * 12}px" title="${esc(c.title)}">${esc(c.title)}</div>`).join('') || '<div class="empty" style="padding:4px 6px">未识别到章节</div>');
 }
 $('chapters').addEventListener('click', (e) => {
   const c = chs[e.target.closest('.ch')?.dataset.i]; if (!c) return;
-  ta.focus(); ta.setSelectionRange(c.s, c.s); ta.scrollTop = Math.max(0, yOf(c.s) - 30);
+  gotoOcc(c.s, c.s);
 });
 $('chapters').addEventListener('contextmenu', (e) => {
+  if (EDITOR) return;
   const el = e.target.closest('.ch'); if (!el) return;
   e.preventDefault();
   const c = chs[el.dataset.i]; if (!c) return;
@@ -376,11 +484,13 @@ $('gallery').addEventListener('click', (e) => {
 function status(t) { $('status').textContent = t; }
 function finalMd() { // 对原文应用 黑名单 + 替换规则
   const md = ta.value;
+  if (EDITOR) return md;
   let out = '', p = 0;
+  nthMap.clear();
   for (const x of sel) { out += md.slice(p, x.s) + replOf(x.it, md.slice(x.s, x.e)); p = x.e; }
   return out + md.slice(p);
 }
-const outName = () => doc.cur.name.replace(/\.docx$/i, '') + '_脱敏.docx';
+const outName = () => doc.cur.name.replace(/\.docx$/i, '') + (EDITOR ? '_新版.docx' : '_脱敏.docx');
 const DOCX_TYPE = [{ description: 'Word', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }];
 const write = async (fh, blob) => { const w = await fh.createWritable(); await w.write(blob); await w.close(); };
 let busy = false;
@@ -395,11 +505,12 @@ async function guarded(fn) {
 // 完整应用方案：直接替换（无修订），图片 / 不可见指纹一并处理，写到 原名_脱敏.docx；可反复执行（每次都从原文重新生成）
 const applyAll = () => guarded(async () => {
   const granted = doc.dir ? (await doc.dir.requestPermission?.({ mode: 'readwrite' })) === 'granted' : false; // 需在用户手势内先拿权限
-  const dropImages = doc.images.filter((i) => i.replaceable && !doc.keep.has(i.path)).map((i) => i.path);
-  const { blob, stats } = await exportDocx(doc.buffer, finalMd(), { track: false, dropImages, wipe: !!state.cats.meta });
+  const dropImages = EDITOR ? [] : doc.images.filter((i) => i.replaceable && !doc.keep.has(i.path)).map((i) => i.path);
+  const { blob, stats } = await exportDocx(doc.buffer, finalMd(), { track: false, dropImages, wipe: !EDITOR && !!state.cats.meta });
   const fh = granted ? await doc.dir.getFileHandle(outName(), { create: true }) : await showSaveFilePicker({ suggestedName: outName(), types: DOCX_TYPE });
   await write(fh, blob);
   doc.outHandle = fh;
+  if (EDITOR) return status(`已保存 ${fh.name}：${stats.del} 删 / ${stats.ins} 插` + (stats.skipped ? `，${stats.skipped} 处无法映射` : ''));
   status(`已生成 ${fh.name}：${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · Ctrl ⏎ 可生成审阅修订');
 });
 
@@ -419,8 +530,12 @@ const reviewToA = () => guarded(async () => {
 $('apply').onclick = applyAll;
 $('append').onclick = reviewToA;
 addEventListener('keydown', (e) => {
+  if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 't' && !EDITOR && !e.target.closest?.('input:not([type=checkbox]), textarea:not([readonly]), [contenteditable]')) { // T：开关章节浮框
+    const cb = document.querySelector('[data-k="chapter"]'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change', { bubbles: true })); return;
+  }
   if (!(e.ctrlKey || e.metaKey)) return;
   const k = e.key.toLowerCase();
+  if (EDITOR && k !== 's') return; // 编辑器模式：撤销交给文本框自带
   if (e.key === 'Enter') { e.preventDefault(); reviewToA(); }
   else if (k === 's') { e.preventDefault(); applyAll(); }
   else if (k === 'z' || k === 'y') {
@@ -432,16 +547,17 @@ addEventListener('keydown', (e) => {
 
 // 右上角 badge：选区总数；每次变化显示增量，增量不是 1（说明匹配到了别处或没匹配到）时暂时变黄
 let lastN = null, flash = 0, flashing = false;
+$('pill').onclick = () => { if (doc.cur) openDoc(doc.entries.indexOf(doc.cur)); };
 function updatePill() {
   const pill = $('pill'), n = sel.length;
-  pill.title = '黑名单 + 替换规则命中的位置总数';
+  pill.title = '黑名单 + 替换规则命中的位置总数 · 点击：关闭并重新打开当前文档';
   if (lastN !== null && n !== lastN) {
     const d = n - lastN;
-    pill.innerHTML = `自加载共 ${n} 次删除<sup>${d > 0 ? '+' : ''}${d}</sup>`;
+    pill.textContent = `${d > 0 ? '+' : ''}${d} 次删除`;
     pill.classList.toggle('hot', d !== 1);
     flashing = true; clearTimeout(flash);
-    flash = setTimeout(() => { flashing = false; pill.classList.remove('hot'); pill.textContent = `自加载共 ${lastN} 次删除`; }, 3000);
-  } else if (!flashing) pill.textContent = `自加载共 ${n} 次删除`;
+    flash = setTimeout(() => { flashing = false; pill.classList.remove('hot'); pill.textContent = `总共${lastN}次删除`; }, 1000);
+  } else if (!flashing) pill.textContent = `总共${n}次删除`;
   lastN = n;
 }
 
@@ -464,25 +580,40 @@ async function openDoc(i) {
   doc.images.forEach((x) => x.url && URL.revokeObjectURL(x.url));
   doc.images = await listImages(p.zip);
   resetKeep();
-  ta.value = p.md; state.ner = []; state.on = {}; memo.clear(); for (const k in visited) delete visited[k];
+  ta.value = p.md; ta.setSelectionRange(0, 0); ta.scrollTop = 0; state.ner = []; state.on = {}; memo.clear(); 
   doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0; blackEl.value = [...words(splitBlack().head).filter((l) => !parseBlackLines([l]).ranges.length), ''].join('\n') + SEP; // 保留黑名单词，行号规则属于旧文档故丢弃
   $('title').textContent = ent.name.replace(/\.docx$/i, '');
   setFileInfo(ent.name, file.size);
   run(); status('已载入 · Ctrl S → _脱敏.docx · Ctrl ⏎ 审阅面板 → A');
   if (ner.ready()) runNer();
 }
+let nerAbort = null;
+const fmtSec = (n) => (n >= 90 ? `${Math.round(n / 60)} 分钟` : `${Math.max(1, Math.round(n))} 秒`);
 async function runNer() {
   if (!doc.parsed) return;
+  nerAbort?.abort(); // 切换文档 / 重新识别时，丢弃上一轮
+  const ac = nerAbort = new AbortController();
   const raw = doc.orig.split('\n');
   const lines = raw.map((l) => (/^(:::|---|\|[ -|]+$)/.test(l) ? '' : l.replace(/\|/g, ' ').replace(/\*+/g, '')));
+  const base = EDITOR ? '纯文本投影编辑器：直接修改文本，Ctrl+S 保存为 原名_新版.docx；右栏只在首次打开和粘贴时识别。' : '已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。';
   $('bannerText').textContent = '离线 NER 识别中…';
   const t0 = performance.now();
   try {
-    state.ner = await ner.recognize(lines, (f) => status(`NER ${(f * 100) | 0}%`));
-    $('bannerText').textContent = `已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。（NER ${((performance.now() - t0) / 1000).toFixed(1)}s · ${ner.backend}）`;
+    const res = await ner.recognize(lines, (f, i) => {
+      const eta = i.etaSec > 1 && f > 0.03 ? ` · 剩约 ${fmtSec(i.etaSec)}` : '';
+      $('bannerText').textContent = `离线 NER 识别中… ${(f * 100) | 0}%${eta}（${ner.backend}${i.tokPerSec ? ` · ${Math.round(i.tokPerSec)} token/s` : ''}）`;
+      status(`NER ${(f * 100) | 0}%${eta}`);
+    }, { signal: ac.signal, onStatus: status });
+    if (ac.signal.aborted) return;
+    state.ner = res;
+    $('bannerText').textContent = `${base}（NER ${((performance.now() - t0) / 1000).toFixed(1)}s · ${ner.backend}）`;
     status('NER 完成');
-  } catch (e) { console.error(e); $('bannerText').textContent = 'NER 失败：' + e.message; }
-  run();
+    saveHandle('nercache', ner.cacheExport());
+  } catch (e) {
+    if (e.name === 'AbortError' || ac.signal.aborted) return;
+    console.error(e); $('bannerText').textContent = 'NER 失败：' + e.message;
+  }
+  EDITOR ? scanPanels() : run();
 }
 
 // 模型：未载入时右上角 ⚠️
@@ -491,7 +622,8 @@ async function loadModelFile(h, name) {
   const file = h.getFile ? await h.getFile() : h;
   warn.hidden = false; warn.textContent = '⚠️ 离线模型载入中…';
   try {
-    const be = await ner.loadModel(await file.arrayBuffer(), (s) => status(s));
+    const be = await ner.loadModel(file); // 只登记文件；推理线程在第一次识别时才拉起
+    ner.cacheImport(await lastHandle('nercache')); // 缓存按内容寻址，模型哈希对得上才会启用
     warn.hidden = true; $('banner').title = `${name} (${mb(file.size)}) · ${be}`;
     status(`模型就绪 · ${be}`);
     if (h.getFile) saveHandle('model', h);
@@ -571,5 +703,61 @@ async function lastHandle(k) { try { const db = await idb(); return await new Pr
   }
 })();
 if (!('showDirectoryPicker' in window)) status('需要基于 Chromium 的浏览器（File System Access API）');
-window.__di = { openDoc, state, ta, run, ner, parseDocx, exportDocx, computeEdits, doc, boxAdd, edit, undo, redo, finalMd, applyAll, reviewToA, get items() { return items; }, get sel() { return sel; } };
+// F12：__di.rules() 查看；__di.rules({ mobile: { re: /…/g }, 新规则: { name, re }, X: null /*删除*/, MAIN: [...], EXTRA: [...], TOOLS: [...], REPLACE: '替换规则文本', TAG_CATS: [...], ENT_CATS: [...], HIDE_WHEN_OFF: [...] }) 动态替换预制规则并重新识别
+function rulesApi(patch) {
+  const lists = { MAIN, EXTRA, TOOLS }, sets = { TAG_CATS, ENT_CATS, HIDE_WHEN_OFF };
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (lists[k]) lists[k].splice(0, lists[k].length, ...v);
+    else if (sets[k]) { sets[k].clear(); v.forEach((x) => sets[k].add(x)); }
+    else if (k === 'REPLACE') $('rules').value = v;
+    else if (v === null) delete RULES[k];
+    else {
+      const r = (RULES[k] ||= { name: k, cls: 'tag' });
+      Object.assign(r, v);
+      if (typeof r.re === 'string') r.re = new RegExp(r.re, 'g');
+      else if (r.re && !r.re.global) r.re = new RegExp(r.re.source, r.re.flags + 'g');
+      r.en ||= k;
+      if (![...MAIN, ...EXTRA].some((x) => x.id === r.en)) EXTRA.push({ id: r.en, name: r.name, def: true });
+    }
+  }
+  for (const x of [...MAIN, ...EXTRA]) state.cats[x.id] ??= x.def !== false;
+  for (const t of TOOLS) state[t.scope][t.id] ??= t.def;
+  renderLeft(); run();
+  return { RULES, MAIN, EXTRA, TOOLS, TAG_CATS, ENT_CATS, HIDE_WHEN_OFF, REPLACE: $('rules').value };
+}
+
+// ---------- #editor 模式 ----------
+if (EDITOR) {
+  document.title = '文本投影编辑器';
+  $('title').textContent = '未打开文件';
+  ta.contentEditable = 'plaintext-only';
+  ta.dataset.ph = '把文件夹（含 .docx）拖到这里，或点右上 ▼ 打开文件夹；直接编辑文本，Ctrl+S 保存到 _新版.docx';
+  $('bannerText').textContent = '纯文本投影编辑器：脱敏功能已关闭，直接修改文本，Ctrl+S 保存为 原名_新版.docx（只改动有差异的段落）。';
+  $('apply').innerHTML = '保存修改<small>（到 _新版.docx）</small>';
+  $('apply').title = 'Ctrl+S：把修改后的文本写回 .docx，保存为 原名_新版.docx';
+  $('status').textContent = 'Ctrl S → _新版.docx · 右栏仅在粘贴时更新';
+  document.querySelector('.left').prepend($('chapters'));
+  ta.addEventListener('input', () => refresh());
+  ta.addEventListener('paste', (e) => { // 右栏：只在粘贴时更新——对粘贴内容做 NER，再对全文重新识别
+    const text = e.clipboardData?.getData('text') || '';
+    setTimeout(async () => {
+      if (text && ner.ready()) {
+        try {
+          const add = await ner.recognize(text.split('\n').map((l) => l.replace(/\|/g, ' ').replace(/\*+/g, '')), () => {}, { onStatus: status });
+          const have = new Set(state.ner.map((n) => n.type + n.text));
+          for (const n of add) if (!have.has(n.type + n.text)) state.ner.push(n);
+        } catch (err) { console.error(err); status('NER 失败：' + err.message); }
+      }
+      scanPanels();
+    }, 0);
+  });
+}
+function scanPanels() {
+  items = scan(ta.value, state);
+  live = [...items.values()].filter(listed);
+  sel = selection(live, isOn);
+  updateCounts(); renderPanels();
+}
+
+window.__di = { ruleNth, rules: rulesApi, openDoc, state, ta, run, ner, parseDocx, exportDocx, computeEdits, doc, boxAdd, edit, undo, redo, finalMd, applyAll, reviewToA, get items() { return items; }, get sel() { return sel; } };
 run();

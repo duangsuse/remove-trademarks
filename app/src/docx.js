@@ -117,6 +117,28 @@ function plainTable(tbl) {
   return grid;
 }
 
+const TOOL_AUTHOR = 'ss';
+// 本工具（作者 ss）上一次写入的修订先「拒绝」掉再投影：删除线里的原文还原成正常文字，插入的内容去掉。
+// 否则 Ctrl+Enter 写入审阅修订后，重新载入 A 时原文已经藏在 w:del 里，投影看不到旧内容、黑名单就扫不出来了；
+// 同时重复写入审阅不会叠加。别的作者的修订保持原样。返回处理的数量。
+function rejectOurs(doc) {
+  let n = 0;
+  const byTag = (t) => [...doc.getElementsByTagNameNS(NS, t)].filter((x) => x.getAttributeNS(NS, 'author') === TOOL_AUTHOR);
+  for (const x of byTag('ins')) { if (x.parentNode && x.parentNode.localName !== 'rPr') { x.remove(); n++; } }
+  for (const x of byTag('del')) {
+    if (!x.parentNode || x.parentNode.localName === 'rPr') continue;
+    for (const dt of [...x.getElementsByTagNameNS(NS, 'delText')]) {
+      const t = doc.createElementNS(NS, 'w:t');
+      t.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
+      t.textContent = dt.textContent;
+      dt.replaceWith(t);
+    }
+    while (x.firstChild) x.parentNode.insertBefore(x.firstChild, x);
+    x.remove(); n++;
+  }
+  return n;
+}
+
 export async function parseDocx(buffer) {
   const zip = await JSZip.loadAsync(buffer);
   const names = Object.keys(zip.files).filter((n) => /^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(n));
@@ -125,7 +147,7 @@ export async function parseDocx(buffer) {
     const xml = await zip.file(path).async('string');
     const doc = new DOMParser().parseFromString(xml, 'application/xml');
     if (doc.getElementsByTagName('parsererror').length) continue;
-    parts.push({ path, doc });
+    parts.push({ path, doc, dirty: rejectOurs(doc) > 0 });
   }
   const paras = [];
   const md = new MD();
@@ -481,7 +503,7 @@ export async function exportDocx(buffer, newMd, { author = 'ss', dropImages = []
   for (const [pid, ed] of byPara) applyParaEdits(m.paras[pid], ed, ctx);
   if (wipe) m.parts.forEach((part) => cleanDom(part.doc));
   for (const part of m.parts) {
-    const touched = wipe || [...byPara.keys()].some((pid) => m.paras[pid].part === part);
+    const touched = wipe || part.dirty || [...byPara.keys()].some((pid) => m.paras[pid].part === part);
     if (!touched) continue;
     let xml = new XMLSerializer().serializeToString(part.doc);
     if (wipe) xml = xml.replace(FP_ATTR, '');
