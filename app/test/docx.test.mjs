@@ -9,7 +9,7 @@ const { window } = new JSDOM('');
 globalThis.DOMParser = window.DOMParser;
 globalThis.XMLSerializer = window.XMLSerializer;
 const { DocxProjection, TOOL_AUTHOR } = await import('../src/docx.js');
-const { scan, selection, replacement, parseRules, chapters, plainOf } = await import('../src/detect.js');
+const { scan, selection, replacement, parseRules, chapters, plainOf, nerLines, spliceMd } = await import('../src/detect.js');
 
 const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
 const DRAW = 'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:v="urn:schemas-microsoft-com:vml"';
@@ -136,6 +136,34 @@ test('审阅修订：写入后重新载入与原文一致，重复写入不叠�
   assert.equal((await allText(data2)).split(`w:author="${TOOL_AUTHOR}"`).length, xml.split(`w:author="${TOOL_AUTHOR}"`).length);
 });
 
+test('含姓名表格：姓名中间有空白时整段命中', () => {
+  const md = '| 姓名 | 张 三 |\n| 联系人： | 李　四： |';
+  const items = scan(md, st([]));
+  assert.deepEqual(items.get('tbl:张三').occ.map(([s, e]) => md.slice(s, e)), ['张 三']);
+  assert.deepEqual(items.get('tbl:李四').occ.map(([s, e]) => md.slice(s, e)), ['李　四']);
+});
+
+test('nerLines：只清空表格分隔行，纯 ASCII 的表格行照常送 NER', () => {
+  assert.deepEqual(nerLines('| --- | --- |\n| John Smith | IBM Corp |\n:::\n---'), ['', '  John Smith   IBM Corp  ', '', '']);
+});
+
+test('spliceMd：跨粗体的命中替换后标记仍成对；以转义字符开头的命中带上反斜杠', () => {
+  const md = '联系人：张**三**，记号 x\\|y。';
+  const items = scan(md, st(['张三', '|y']));
+  const sel = selection([...items.values()], () => true);
+  assert.deepEqual(sel.map((x) => md.slice(x.s, x.e)), ['张**三', '\\|y']);
+  assert.equal(spliceMd(md, sel.map((x) => ({ ...x, text: 'XX' }))), '联系人：XX****，记号 xXX。');
+});
+
+test('区间替换：以转义字符开头的命中写入 docx 后不留反斜杠', async () => {
+  const d = await DocxProjection.load(await sample());
+  const sel = selection([scan(d.md, st(['|b'])).get('bl:|b')], () => true);
+  assert.equal(sel.length, 1);
+  assert.equal(d.replace(sel.map((x) => ({ ...x, text: 'Z' }))).skipped, 0);
+  const d2 = await DocxProjection.load((await d.save({ type: 'uint8array' })).data);
+  assert.match(d2.md, /\| aZ \| x\\\*y \|/);
+});
+
 test('selection：重叠命中合并，不漏半截', () => {
   const a = { occ: [[10, 12]] }, b = { occ: [[11, 15]] };
   const out = selection([a, b], () => true);
@@ -150,6 +178,7 @@ test('替换模板：白名单求值，不执行任意代码', () => {
   assert.equal(replacement('南京路', rules, { kind: '地址', nth: () => ++n }), '地址1');
   assert.equal(replacement('X', parseRules('X => {globalThis.x=1}')), '{globalThis.x=1}');
   assert.equal(globalThis.x, undefined);
+  assert.equal(replacement('价$1', parseRules('.* => [{s}]$0')), '[价$1]价$1', '命中文本里的 $1 不再被展开');
 });
 
 const REAL = new URL('../../3、C3443 阀门和旋塞制造-杰林石化-2026江苏省先进级智能工厂申报书.docx', import.meta.url);

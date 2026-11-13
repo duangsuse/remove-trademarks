@@ -1,8 +1,9 @@
 import './style.css';
 import { DocxProjection, listImages } from './docx.js';
-import { scan, parseRules, parseCustom, parseBlackLines, replacement, selection, chapters, plainOf, unmark, nerLines } from './detect.js';
+import { scan, parseRules, parseCustom, parseBlackLines, replacement, selection, chapters, plainOf, unmark, nerLines, spliceMd } from './detect.js';
 import { MAIN, EXTRA, TOOLS, TYPE_NAME, DEFAULT_REPLACE_RULES, HIDE_WHEN_OFF, TAG_CATS, ENT_CATS, TITLE_RE, ABBR_MAX, RULES, FINGERPRINT_URL, ABBR_RE, NAME_LABELS, NAME_VALUE } from './rules.js';
 import * as ner from './ner.js';
+import * as fs from './fs.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -47,7 +48,7 @@ const state = { cats: { custom: true }, tools: {}, blacklist: [], ranges: [], cu
 for (const x of [...MAIN, ...EXTRA]) state.cats[x.id] = x.def !== false;
 for (const t of TOOLS) state[t.scope][t.id] = t.def;
 const doc = { entries: [], dir: null, cur: null, buffer: null, parsed: null, orig: '', images: [], order: [], keep: new Set(), outHandle: null };
-let pendingModel = null;
+let pendingModel = null, pendingDir = null; // 上次的模型 / 文件夹句柄，权限待点击后请求
 
 const SPECIAL_CODE = {
   img: '图片：替换为 1×1 占位图（勾选缩略图可保留）', meta: '.docx 不可见指纹抹除：作者/公司属性、缩略图、批注、修订记录、隐藏文字、rsid/paraId 等',
@@ -520,16 +521,11 @@ function redactions() { // 黑名单 + 替换规则 → md 区间替换 [{s, e, 
   return sel.map((x) => ({ s: x.s, e: x.e, text: replOf(x.it, plainOf(md, x.s, x.e)) }));
 }
 function finalMd() { // 预览：对原文应用 黑名单 + 替换规则
-  const md = ta.value;
-  if (EDITOR) return md;
-  let out = '', p = 0;
-  for (const x of redactions()) { out += md.slice(p, x.s) + x.text; p = x.e; }
-  return out + md.slice(p);
+  return EDITOR ? ta.value : spliceMd(ta.value, redactions());
 }
 const alertList = (title, ws) => { if (ws.length) alert(title + '\n\n' + ws.map((w) => '• ' + w).join('\n')); };
 const outName = () => doc.cur.name.replace(/\.docx$/i, '') + (EDITOR ? '_新版.docx' : '_脱敏.docx');
 const DOCX_TYPE = [{ description: 'Word', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }];
-const write = async (fh, blob) => { const w = await fh.createWritable(); await w.write(blob); await w.close(); };
 let busy = false;
 async function guarded(fn) {
   if (!doc.parsed) return status('请先打开文件：点右上 ▼ 或把文件夹拖进来');
@@ -541,15 +537,15 @@ async function guarded(fn) {
 
 // 完整应用方案：直接替换（无修订），图片 / 不可见指纹一并处理，写到 原名_脱敏.docx；可反复执行（每次都从原文重新生成）
 const applyAll = () => guarded(async () => {
-  const granted = doc.dir ? (await doc.dir.requestPermission?.({ mode: 'readwrite' })) === 'granted' : false; // 需在用户手势内先拿权限
+  const granted = !!doc.dir && (await fs.allowed(doc.dir, true, true)); // 需在用户手势内先拿权限
   const dropImages = EDITOR ? [] : doc.images.filter((i) => i.replaceable && !doc.keep.has(i.path)).map((i) => i.path);
   const d = await DocxProjection.load(doc.buffer);
   const stats = EDITOR ? d.applyText(ta.value) : d.replace(redactions());
   d.dropImages(dropImages);
   if (!EDITOR && state.cats.meta) d.wipe();
   const { blob, warnings } = await d.save();
-  const fh = granted ? await doc.dir.getFileHandle(outName(), { create: true }) : await showSaveFilePicker({ suggestedName: outName(), types: DOCX_TYPE });
-  await write(fh, blob);
+  const fh = granted ? await fs.child(doc.dir, outName(), true) : await fs.pickSave(outName(), DOCX_TYPE);
+  await fs.write(fh, blob);
   doc.outHandle = fh;
   alertList(`已写入 ${fh.name}，但有以下问题：`, warnings);
   if (EDITOR) return status(`已保存 ${fh.name}：${stats.del} 删 / ${stats.ins} 插` + (stats.skipped ? `，${stats.skipped} 处无法映射` : ''));
@@ -558,17 +554,15 @@ const applyAll = () => guarded(async () => {
 
 // 审阅面板：只读取并对比 A（已载入的原文）与 A_脱敏，差异作为修订写入 A；不看黑名单，也可当 diff 用
 const reviewToA = () => guarded(async () => {
-  if ((await doc.cur.h.requestPermission?.({ mode: 'readwrite' })) !== 'granted') throw new Error('没有写入原文件的权限');
-  let hB = null;
-  if (doc.dir) hB = await doc.dir.getFileHandle(outName()).catch(() => null);
-  hB ||= doc.outHandle;
-  if (!hB) { status(`未找到 ${outName()}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); [hB] = await showOpenFilePicker({ types: DOCX_TYPE }); }
-  const b = await DocxProjection.load(await (await hB.getFile()).arrayBuffer());
-  const a = await DocxProjection.load(await (await doc.cur.h.getFile()).arrayBuffer()); // 现读 A：保留打开后在 Word 里做的修改，上次写入的修订载入时已撤掉
+  if (!(await fs.allowed(doc.cur.h, true, true))) throw new Error('没有写入原文件的权限');
+  let hB = (doc.dir && (await fs.child(doc.dir, outName()))) || doc.outHandle;
+  if (!hB) { status(`未找到 ${outName()}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); hB = await fs.pickFile(DOCX_TYPE); }
+  const b = await DocxProjection.load(await fs.read(hB));
+  const a = await DocxProjection.load(await fs.read(doc.cur.h)); // 现读 A：保留打开后在 Word 里做的修改，上次写入的修订载入时已撤掉
   const stats = a.applyText(b.md, { from: b });
   if (!stats.del && !stats.ins) return status(`${doc.cur.name} 与 ${hB.name} 的文字没有差异，未写入`);
   const { blob, warnings } = await a.save({ track: true });
-  await write(doc.cur.h, blob);
+  await fs.write(doc.cur.h, blob);
   alertList(`已写入 ${doc.cur.name}，但有以下问题：`, warnings);
   status(`已把 ${hB.name} 的差异写入 ${doc.cur.name}：${stats.del} 处删除 / ${stats.ins} 处插入` + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · 请在 Word 审阅面板检查后保存');
 });
@@ -618,7 +612,7 @@ function setFileInfo(name, size) { $('fileInfo').textContent = name ? `${shortNa
 async function openDoc(i) {
   const ent = doc.entries[i]; if (!ent) return;
   status('读取中…');
-  const file = await ent.h.getFile();
+  const file = await fs.file(ent.h);
   doc.buffer = await file.arrayBuffer(); doc.cur = ent;
   const p = await DocxProjection.load(doc.buffer);
   doc.parsed = p; doc.orig = p.md;
@@ -653,7 +647,7 @@ async function runNer() {
     state.ner = res;
     $('bannerText').textContent = `${base}（NER ${((performance.now() - t0) / 1000).toFixed(1)}s · ${ner.backend}）`;
     status('NER 完成');
-    saveHandle('nercache', ner.cacheExport());
+    fs.remember('nercache', ner.cacheExport());
   } catch (e) {
     if (e.name === 'AbortError' || ac.signal.aborted) return;
     console.error(e); $('bannerText').textContent = 'NER 失败：' + e.message;
@@ -664,29 +658,30 @@ async function runNer() {
 // 模型：未载入时右上角 ⚠️
 const warn = $('modelWarn');
 async function loadModelFile(h, name) {
-  const file = h.getFile ? await h.getFile() : h;
+  const file = await fs.file(h);
   warn.hidden = false; warn.textContent = '⚠️ 离线模型载入中…';
   try {
     const be = await ner.loadModel(file); // 只登记文件；推理线程在第一次识别时才拉起
-    ner.cacheImport(await lastHandle('nercache')); // 缓存按内容寻址，模型哈希对得上才会启用
+    ner.cacheImport(await fs.recall('nercache')); // 缓存按内容寻址，模型哈希对得上才会启用
     warn.hidden = true; $('banner').title = `${name} (${mb(file.size)}) · ${be}`;
     status(`模型就绪 · ${be}`);
-    if (h.getFile) saveHandle('model', h);
+    if (h.getFile) fs.remember('model', h);
     if (doc.parsed) runNer(); else run();
   } catch (e) { console.error(e); warn.textContent = '⚠️ 模型载入失败：' + e.message; }
 }
 warn.onclick = async () => {
   try {
-    if (pendingModel) { if ((await pendingModel.requestPermission({ mode: 'read' })) === 'granted') return loadModelFile(pendingModel, pendingModel.name); }
-    const [h] = await showOpenFilePicker({ types: [{ description: 'ONNX', accept: { 'application/octet-stream': ['.onnx'] } }] });
+    if (pendingModel && (await fs.allowed(pendingModel, false, true))) return loadModelFile(pendingModel, pendingModel.name);
+    const h = await fs.pickFile([{ description: 'ONNX', accept: { 'application/octet-stream': ['.onnx'] } }]);
     await loadModelFile(h, h.name);
   } catch (e) { if (e.name !== 'AbortError') status(e.message); }
 };
 
+// 返回文件夹里是否有模型
 async function openFolder(dir) {
-  doc.dir = dir; doc.entries = []; let model = null;
-  for await (const [name, h] of dir.entries()) {
-    if (h.kind !== 'file') continue;
+  doc.dir = dir; doc.entries = []; pendingDir = null; let model = null;
+  fs.remember('dir', dir);
+  for (const { name, h } of await fs.list(dir)) {
     if (/\.docx$/i.test(name) && !name.startsWith('~$') && !/(?:_脱敏|-红化)\.docx$/.test(name)) doc.entries.push({ name, h });
     else if (/\.onnx$/i.test(name) && (!model || /quant|q8/i.test(name))) model = { name, h };
   }
@@ -694,9 +689,14 @@ async function openFolder(dir) {
   if (model && !ner.ready()) loadModelFile(model.h, model.name);
   if (doc.entries.length) await openDoc(0);
   else status('该文件夹没有 .docx');
+  return !!model;
 }
 async function pickFolder() {
-  try { await handleItems([await showDirectoryPicker({ mode: 'readwrite' })]); } catch (e) { if (e.name !== 'AbortError') status(e.message); }
+  try { await handleItems([await fs.pickDir()]); } catch (e) { if (e.name !== 'AbortError') status(e.message); }
+}
+async function resumeFolder() { // 继续上次的文件夹：点击时请求权限（Chromium 可选「每次访问都允许」），被拒则改为选择
+  try { if (await fs.allowed(pendingDir, true, true)) return await openFolder(pendingDir); } catch (e) { console.error(e); }
+  pickFolder();
 }
 const menu = $('fileMenu');
 function openMenu() {
@@ -706,7 +706,7 @@ function openMenu() {
 $('fileSel').addEventListener('click', (e) => {
   const it = e.target.closest('#fileMenu > div');
   if (it) { menu.hidden = true; if (it.dataset.act) pickFolder(); else openDoc(+it.dataset.i); return; }
-  if (!doc.entries.length) return pickFolder();
+  if (!doc.entries.length) return pendingDir ? resumeFolder() : pickFolder();
   menu.hidden ? openMenu() : (menu.hidden = true);
 });
 addEventListener('click', (e) => { if (!e.target.closest('#fileSel')) menu.hidden = true; });
@@ -734,16 +734,20 @@ addEventListener('drop', async (e) => {
   if (hs.length) handleItems(hs).catch((err) => { console.error(err); status(err.message); });
 });
 
-// ---------- 记住上次模型文件句柄 ----------
-function idb() { return new Promise((res, rej) => { const r = indexedDB.open('di', 1); r.onupgradeneeded = () => r.result.createObjectStore('h'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
-async function saveHandle(k, v) { try { const db = await idb(); db.transaction('h', 'readwrite').objectStore('h').put(v, k); } catch { /* 忽略 */ } }
-async function lastHandle(k) { try { const db = await idb(); return await new Promise((res) => { const q = db.transaction('h').objectStore('h').get(k); q.onsuccess = () => res(q.result); q.onerror = () => res(null); }); } catch { return null; } }
+// ---------- 找回上次的文件夹、模型：已有「每次访问都允许」的权限就直接打开，否则等点击 ----------
 (async () => {
   warn.hidden = false;
-  const h = await lastHandle('model');
-  if (h) {
+  let hasModel = false;
+  const dir = await fs.recall('dir');
+  if (dir && !doc.entries.length) {
+    pendingDir = dir;
+    if (await fs.allowed(dir, true).catch(() => false)) hasModel = await openFolder(dir).catch((e) => { console.error(e); return false; });
+    else $('fileInfo').textContent = `📂 继续上次：${dir.name}`;
+  }
+  const h = await fs.recall('model');
+  if (h && !hasModel) {
     pendingModel = h;
-    if ((await h.queryPermission?.({ mode: 'read' })) === 'granted') loadModelFile(h, h.name);
+    if (await fs.allowed(h).catch(() => false)) loadModelFile(h, h.name);
     else warn.textContent = `⚠️ 离线模型未载入（点击载入 ${h.name}）`;
   }
 })();

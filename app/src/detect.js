@@ -10,10 +10,10 @@ export const unmark = (s) => s.replace(/\\([\s\S])|\*+/g, (m, c) => c ?? '');
 let viewOf = { md: null, v: null };
 export function plainView(md) {
   if (viewOf.md === md) return viewOf.v;
-  const out = [], idx = new Int32Array(md.length + 1);
+  const out = [], idx = new Int32Array(md.length + 1), esc = new Uint8Array(md.length + 1); // esc[k]：text[k] 在 md 里带转义反斜杠
   for (let i = 0; i < md.length; i++) {
     const c = md[i];
-    if (c === '\\' && i + 1 < md.length) { idx[out.length] = ++i; out.push(md[i]); }
+    if (c === '\\' && i + 1 < md.length) { esc[out.length] = 1; idx[out.length] = ++i; out.push(md[i]); }
     else if (c !== '*') { idx[out.length] = i; out.push(c); }
   }
   const n = out.length;
@@ -21,7 +21,7 @@ export function plainView(md) {
   const lower = (pos) => { let a = 0, b = n; while (a < b) { const m = (a + b) >> 1; if (idx[m] < pos) a = m + 1; else b = m; } return a; };
   const v = {
     text: out.join(''),
-    toMd: (s, e) => [idx[s], e > s ? idx[e - 1] + 1 : idx[s]], // 视图区间 -> md 区间
+    toMd: (s, e) => [idx[s] - esc[s], e > s ? idx[e - 1] + 1 : idx[s]], // 视图区间 -> md 区间（以转义字符开头时连反斜杠一起）
     slice: (s, e) => v.text.slice(lower(s), lower(e)), // md 区间 -> 视图文字
   };
   viewOf = { md, v };
@@ -29,8 +29,16 @@ export function plainView(md) {
 }
 export const plainOf = (md, s, e) => plainView(md).slice(s, e);
 
+// 对 md 应用区间替换 [{s, e, text}]（已按 s 排序、不重叠）。区间里的粗斜体标记原样留下，
+// 否则「张**三**」命中「张**三」时会剩下落单的 **
+export function spliceMd(md, reps) {
+  let out = '', p = 0;
+  for (const x of reps) { out += md.slice(p, x.s) + x.text + md.slice(x.s, x.e).replace(/\\[\s\S]|[^*]/g, ''); p = x.e; }
+  return out + md.slice(p);
+}
+
 // 送给 NER 的行：与 md 行一一对应；结构行（表格分隔、特殊表格边界、分隔线）置空，表格竖线换成空格
-export const nerLines = (md) => plainView(md).text.split('\n').map((l) => (/^(?::::|---|\|[ -|]+$)/.test(l) ? '' : l.replace(/\|/g, ' ')));
+export const nerLines = (md) => plainView(md).text.split('\n').map((l) => (/^(?::::|---|\|[ |-]+$)/.test(l) ? '' : l.replace(/\|/g, ' ')));
 
 function findAll(md, text, add) {
   if (!text) return;
@@ -77,7 +85,7 @@ function tableNames(text, put) {
       let p = start + 2, prevLabel = false;
       for (const cell of line.slice(2, -2).split(' | ')) {
         const t = strip(cell);
-        if (prevLabel && NAME_VALUE.test(t) && !NAME_STOP.test(t)) { const i = Math.max(0, cell.indexOf(t)); put(t, p + i, p + i + t.length); }
+        if (prevLabel && NAME_VALUE.test(t) && !NAME_STOP.test(t)) { const a = cell.search(/[^：:\s]/), z = cell.search(/[：:\s]*$/); put(t, p + a, p + z); } // 「张 三」：整段（含中间空白）都算命中，不能按 t 的长度截
         prevLabel = NAME_LABELS.test(t);
         p += cell.length + 3;
       }
@@ -220,7 +228,8 @@ function evalTpl(expr, vars, nth) {
 }
 function expand(rep, m, kind, nth) {
   const vars = { s: m[0], $m: m, kind };
-  return rep.replace(/\{([^{}]+)\}/g, (all, expr) => evalTpl(expr, vars, nth) ?? all).replace(/\$(\d)/g, (_, k) => m[+k] ?? '');
+  // 一遍完成：展开结果里的 $1 等不会再被当成分组引用
+  return rep.replace(/\{([^{}]+)\}|\$(\d)/g, (all, expr, k) => (expr !== undefined ? evalTpl(expr, vars, nth) ?? all : m[+k] ?? ''));
 }
 // ctx：names 该条目的类别名（供 ::类别:: 前缀匹配），kind 显示名，nth(kind, s) 编号函数
 export function replacement(text, rules, { names = [], kind = '', nth = null } = {}) {
