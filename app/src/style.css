@@ -3,7 +3,7 @@
   --bg: #e9e5d6; --panel: #f3efe0; --line: #d6d0bb; --text: #3b3a35; --mute: #7d7a6c; --primary: #3f6f8f; --primary-t: #f6f2e4;
   --soft: #dde3d8; --ok: #5a7a2c; --ok-bg: #dfe5c8; --warn-bg: #efe0b8; --warn: #a8691a;
   --hl-tag: #e8d48a; --hl-warn: #e6b5a6; --hl-place: #b9cfd8; --hl-cand: #e6c79c; --hl-black: #d3c4de; --hl-phone: #c3c8ee; --hl-mail: #d6c3dc; --hl-person: #e3bccb;
-  --hl-company: #efc890; --hl-addr: #bccbec; --hl-date: #ddd3b8; --hl-net: #c8d2da; --hl-abbr: #dcd59e; --hl-custom: #b9dcd6; --hl-top1: #f2a97e; --hl-top2: #9fd8cf; --hl-top3: #d9b3f0;
+  --hl-company: #efc890; --hl-addr: #bccbec; --hl-date: #ddd3b8; --hl-net: #c8d2da; --hl-abbr: #dcd59e; --hl-custom: #b9dcd6; --hl-top1: #f2a97e; --hl-top2: #9fd8cf; --hl-top3: #d9b3f0; --hl-frame: #cfe0c4;
   --editor: #f6f2e4; --shadow: 0 1px 2px rgba(60,50,20,.08);
   --font-ui: system-ui, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   --r-s: 6px; --r-m: 10px; --r-pill: 99px; --r-dot: 50%;
@@ -13,7 +13,7 @@
   --bg: #0f1420; --panel: #171e2e; --line: #28324a; --text: #e6ebf7; --mute: #8e9ab5; --primary: #4c7dff; --primary-t: #fff;
   --soft: #1b2745; --ok: #55d68a; --ok-bg: #12301f; --warn-bg: #2b2412; --warn: #f0a93a;
   --hl-tag: #6b5a12; --hl-warn: #6d2a26; --hl-place: #25427a; --hl-cand: #6d4516; --hl-black: #48307a; --hl-phone: #2c3a7a; --hl-mail: #4a2d73; --hl-person: #7a2d53;
-  --hl-company: #75520f; --hl-addr: #1f4f7a; --hl-date: #4f4630; --hl-net: #34404f; --hl-abbr: #4f4a1a; --hl-custom: #1d4f4f; --hl-top1: #8a3d12; --hl-top2: #0f5a52; --hl-top3: #5a2a7a;
+  --hl-company: #75520f; --hl-addr: #1f4f7a; --hl-date: #4f4630; --hl-net: #34404f; --hl-abbr: #4f4a1a; --hl-custom: #1d4f4f; --hl-top1: #8a3d12; --hl-top2: #0f5a52; --hl-top3: #5a2a7a; --hl-frame: #2f4f2a;
   --editor: #131a28; --shadow: none;
   color-scheme: dark;
 }
@@ -22,7 +22,7 @@
   --bg: #232a2e; --panel: #2d353b; --line: #475258; --text: #d3c6aa; --mute: #859289; --primary: #7fbbb3; --primary-t: #2d353b;
   --soft: #343f44; --ok: #a7c080; --ok-bg: #425047; --warn-bg: #4d4c43; --warn: #dbbc7f;
   --hl-tag: #5a5a3e; --hl-warn: #6b3f44; --hl-place: #3a515d; --hl-cand: #5c4a36; --hl-black: #4a444e; --hl-phone: #3d4a66; --hl-mail: #54466a; --hl-person: #63415a;
-  --hl-company: #5f5236; --hl-addr: #34506a; --hl-date: #4d4c43; --hl-net: #3f4b52; --hl-abbr: #545032; --hl-custom: #2f554f; --hl-top1: #6b4a32; --hl-top2: #2f5a4a; --hl-top3: #5a3f6b;
+  --hl-company: #5f5236; --hl-addr: #34506a; --hl-date: #4d4c43; --hl-net: #3f4b52; --hl-abbr: #545032; --hl-custom: #2f554f; --hl-top1: #6b4a32; --hl-top2: #2f5a4a; --hl-top3: #5a3f6b; --hl-frame: #3f5a3a;
   --editor: #272e33; --shadow: none;
   --font-ui: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace, "Noto Sans Mono CJK SC", "Noto Sans CJK SC", monospace;
   --r-s: 0; --r-m: 0; --r-pill: 0; --r-dot: 0;

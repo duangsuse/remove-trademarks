@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "predev": "test -f model_quantized.onnx || curl -L --fail -o model_quantized.onnx https://huggingface.co/Xenova/bert-base-chinese-ner/resolve/main/onnx/model_quantized.onnx",
     "dev": "vite",
     "build": "vite build",
     "di": "node tools/di.mjs"

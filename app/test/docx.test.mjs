@@ -309,3 +309,93 @@ test('黑名单框：load / dump 互逆；add / remove 按行号区间去重', (
   assert.deepEqual(BlackBox.load(BlackBox.add(text, '王五')).entries, ['张三', '#L3~L5', '王五']);
   assert.deepEqual(BlackBox.load(BlackBox.remove(text, '#L3~5')).entries, ['张三']);
 });
+
+test('纯文本投影：<br> 是 1 个字符（行号不变）；转义掉的结构标记不当结构', async () => {
+  const { plainView, BR } = await import('../src/plain.js');
+  const md = '甲<br>乙\n\\| 姓名 | x |\n\\<details>:::a\n负责人 张三';
+  const v = plainView(md);
+  assert.equal(v.text.split('\n').length, md.split('\n').length);
+  assert.equal(v.text.split('\n')[0], '甲' + BR + '乙');
+  assert.deepEqual(v.toMd(1, 2), [1, 5]); // <br> 整个映射回 md
+  assert.deepEqual(v.lines.map((l) => l.kind), ['text', 'text', 'text', 'text']);
+});
+
+const tabSample = () => sample(p(t('姓名') + '<w:r><w:tab/></w:r>' + t('张三')) + p(t('末尾')));
+const imgTok = '![张三身份证](media/image1.png)';
+
+test('制表符可编辑：删除、插入，审阅模式下是删除线 / 插入', async () => {
+  const d = await DocxProjection.load(await tabSample());
+  assert.ok(d.md.includes('姓名\t张三'.replace(' ', '')));
+  const i = d.md.indexOf('姓名\t') + 2;
+  assert.equal(d.anchor(i).editable, true);
+  d.replace([{ s: i, e: i + 1, text: '：' }, { s: d.md.indexOf('末尾'), e: d.md.indexOf('末尾'), text: '\t' }]);
+  const d2 = await roundTrip(d);
+  assert.ok(d2.md.includes('姓名：张三') && d2.md.includes('\t末尾'));
+  const e = await DocxProjection.load(await tabSample());
+  e.replace([{ s: i, e: i + 1, text: '' }]);
+  const { data } = await e.save({ type: 'uint8array', track: true });
+  const xml = await (await JSZip.loadAsync(data)).file('word/document.xml').async('string');
+  assert.match(xml, /<w:del [^>]*><w:r><w:tab\/><\/w:r><\/w:del>/);
+  assert.ok((await DocxProjection.load(data)).md.includes('姓名\t张三'), '重新载入先撤销自己的修订');
+});
+
+test('图片：整段删除、移动、复制，不能凭空新增', async () => {
+  const buf = await tabSample();
+  const media = (xml) => (xml.match(/r:embed="rI"/g) || []).length;
+  // 删除
+  let d = await DocxProjection.load(buf);
+  d.applyText(d.md.replace(imgTok + '\n', '\n'));
+  let { data, warnings } = await d.save({ type: 'uint8array' });
+  assert.deepEqual(warnings, []);
+  assert.equal(media(await (await JSZip.loadAsync(data)).file('word/document.xml').async('string')), 0);
+  assert.doesNotMatch((await DocxProjection.load(data)).md, /image1\.png/);
+  // 移动（alt 跟着走）：从原处剪切，贴到「末尾」行
+  d = await DocxProjection.load(buf);
+  d.applyText(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok));
+  ({ data, warnings } = await d.save({ type: 'uint8array' }));
+  assert.deepEqual(warnings, []);
+  const md2 = (await DocxProjection.load(data)).md;
+  assert.equal(md2.split(imgTok).length, 2, '仍是一张');
+  assert.ok(md2.includes('末尾' + imgTok));
+  // 复制：原图不动，多出一张（同一媒体文件，docPr id 不重复）
+  d = await DocxProjection.load(buf);
+  d.applyText(d.md.replace('末尾', '末尾' + imgTok));
+  ({ data, warnings } = await d.save({ type: 'uint8array' }));
+  assert.deepEqual(warnings, []);
+  assert.equal((await DocxProjection.load(data)).md.split(imgTok).length, 3, '两张');
+  const dx = await (await JSZip.loadAsync(data)).file('word/document.xml').async('string');
+  assert.equal(media(dx), 2);
+  const dids = [...dx.matchAll(/<wp:docPr id="(\d+)"/g)].map((m) => m[1]);
+  assert.equal(new Set(dids).size, dids.length, 'docPr id 不重复');
+  // 一删一贴两份：第一份是移动、第二份是复制
+  d = await DocxProjection.load(buf);
+  d.applyText(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok + imgTok));
+  ({ data, warnings } = await d.save({ type: 'uint8array' }));
+  assert.deepEqual(warnings, []);
+  assert.equal((await DocxProjection.load(data)).md.split(imgTok).length, 3);
+  // 凭空写一个：同样忽略
+  d = await DocxProjection.load(buf);
+  d.applyText(d.md.replace('末尾', '末尾![x](media/other.png)'));
+  ({ data, warnings } = await d.save({ type: 'uint8array' }));
+  assert.match(warnings.join(), /新增图片被忽略/);
+  assert.doesNotMatch((await DocxProjection.load(data)).md, /other\.png/);
+});
+
+test('图片：审阅模式下删除是删除线、移动的副本换新 id；整行删除会带走图片', async () => {
+  const buf = await tabSample();
+  let d = await DocxProjection.load(buf);
+  d.applyText(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok));
+  let { data } = await d.save({ type: 'uint8array', track: true });
+  const xml = await (await JSZip.loadAsync(data)).file('word/document.xml').async('string');
+  assert.match(xml, /<w:del [^>]*><w:r><w:drawing>/);
+  assert.match(xml, /<w:ins [^>]*><w:r><w:drawing>/);
+  const ids = [...xml.matchAll(/<wp:docPr id="(\d+)"/g)].map((m) => m[1]);
+  assert.equal(new Set(ids).size, ids.length, 'docPr id 不重复');
+  assert.equal((await DocxProjection.load(data)).md.split(imgTok).length, 2);
+  d = await DocxProjection.load(buf);
+  const n = d.md.split('\n').findIndex((l) => l === imgTok) + 1;
+  d.editText((s) => s, { range: lineRange(d.md, n) });
+  d.replace([{ s: d.md.indexOf(imgTok), e: d.md.indexOf(imgTok) + imgTok.length, text: '' }]);
+  ({ data } = await d.save({ type: 'uint8array' }));
+  assert.doesNotMatch((await DocxProjection.load(data)).md, /image1\.png/);
+});

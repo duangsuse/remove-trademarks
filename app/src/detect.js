@@ -5,7 +5,7 @@ import { lineRule } from './boxes.js';
 import { plainView, unmark } from './plain.js';
 
 // 送给 NER 的行：与 md 行一一对应；结构行置空，表格竖线换成空格
-export const nerLines = (md) => readLines(plainView(md).text).map((l) => (l.structural ? '' : l.text.replace(/\|/g, ' ')));
+export const nerLines = (md) => plainView(md).lines.map((l) => (l.structural ? '' : l.text.replace(/\|/g, ' ')));
 
 function findAll(md, text, add) {
   if (!text) return;
@@ -14,10 +14,10 @@ function findAll(md, text, add) {
 }
 
 // 含姓名的表格：标签格的下一格 / 特殊表格中标签行的下一行
-function tableNames(text, put) {
+function tableNames(lines, put) {
   let label = false;
   const strip = (s) => s.replace(/[：:\s]/g, '');
-  for (const { text: line, s: start, n: ln, kind } of readLines(text)) {
+  for (const { text: line, s: start, n: ln, kind } of lines) {
     if (kind === 'open' || kind === 'close') { label = false; continue; }
     if (kind === 'table') {
       let p = start + 2, prevLabel = false;
@@ -91,7 +91,7 @@ export function scan(md0, st0 = {}) {
   const abbr = new Set();
   for (const m of md.matchAll(ABBR_RE)) abbr.add(m[1]);
   for (const w of abbr) findAll(md, w, (s, e) => put('abbr:' + w, w, { cat: 'abbr', en: 'abbr', cls: 'abbr' }, s, e));
-  tableNames(md, (t, s, e, ln) => (ln
+  tableNames(view.lines, (t, s, e, ln) => (ln
     ? put('tbl:' + lineRule.dump(ln), lineRule.dump(ln), { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true, del: true, show: t }, s, e)
     : put('tbl:' + t, t, { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true }, s, e)));
   // 模型只做兜底召回：规则 / 黑名单已识别的公司、地址里的碎片（"件有限公司"、"东华软"）不再重复列出

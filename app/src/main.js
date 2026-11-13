@@ -2,7 +2,7 @@ import './style.css';
 import { DocxProjection, listImages } from './docx.js';
 import { scan, replacement, selection, chapters, nerLines } from './detect.js';
 import { plainOf, unmark, spliceMd, lineRange } from './plain.js';
-import { partnerOf } from './markup.js';
+import { partnerOf, readLines } from './markup.js';
 import { BlackBox, lineRule, parseRules, parseCustom } from './boxes.js';
 import { MAIN, EXTRA, TOOLS, TYPE_NAME, DEFAULT_REPLACE_RULES, HIDE_WHEN_OFF, TAG_CATS, ENT_CATS, TITLE_RE, ABBR_MAX, RULES, FINGERPRINT_URL, ABBR_RE, NAME_LABELS, NAME_VALUE } from './rules.js';
 import * as ner from './ner.js';
@@ -18,7 +18,7 @@ const root = document.documentElement, THEMES = ['light', 'dark', 'omarchy'];
 root.dataset.theme = store.get('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 $('logo').onclick = () => { root.dataset.theme = THEMES[(THEMES.indexOf(root.dataset.theme) + 1) % THEMES.length]; store.set('theme', root.dataset.theme); };
 // 高亮类别（rules.js 的 cls 与 top1~3）：底色取各主题的 --hl-<类别>
-const HL = ['tag', 'warn', 'place', 'cand', 'black', 'phone', 'mail', 'person', 'company', 'addr', 'date', 'net', 'abbr', 'custom', 'top1', 'top2', 'top3'];
+const HL = ['tag', 'warn', 'place', 'cand', 'black', 'phone', 'mail', 'person', 'company', 'addr', 'date', 'net', 'abbr', 'custom', 'top1', 'top2', 'top3', 'frame'];
 document.head.append(Object.assign(document.createElement('style'), { textContent: HL.map((k) => `::highlight(${k}), .badge.${k}, .row.${k} { background-color: var(--hl-${k}); }`).join('\n') }));
 
 // URL 带 #editor：关闭脱敏功能，当作纯文本投影编辑器（Ctrl+S → _新版.docx）；左栏只剩章节，右栏仅在粘贴时更新
@@ -209,6 +209,10 @@ Object.defineProperties(ta, {
   selectionEnd: { get: () => lastSel[1] },
 });
 ta.setSelectionRange = (s, e) => { const g = getSelection(); g.removeAllRanges(); g.addRange(rangeOf(s, e)); lastSel = [s, e]; };
+// 特殊表格的边界行（点一下会跳到另一头）；#editor 模式也要画
+function frameLines(by) {
+  for (const l of readLines(ta.value)) if (l.kind === 'open' || l.kind === 'close') (by.frame ||= new Highlight()).add(rangeOf(l.s, l.s + l.text.length));
+}
 // 高亮：每个类别一个 Highlight（样式见 ::highlight(...)）；未选中（不会被打码）的统一用 off（下划线）
 function paintHighlights(occ) {
   CSS.highlights.clear();
@@ -221,6 +225,7 @@ function paintHighlights(occ) {
     (by[on || ranked ? cls(o.it) : 'off'] ||= new Highlight()).add(r); // 前 3 名不论选没选都整段着色，未选再加下划线
     if (ranked && !on) (by.off ||= new Highlight()).add(r);
   }
+  frameLines(by);
   for (const k in by) CSS.highlights.set(k, by[k]);
 }
 let items = new Map(), live = [], sel = [], tm = 0, chs = [];
@@ -239,7 +244,7 @@ function rankNer() {
 function refresh(now) { clearTimeout(tm); tm = setTimeout(run, now ? 0 : 160); }
 function run() {
   clearTimeout(tm);
-  if (EDITOR) { renderChapters(); return; } // 编辑器模式：只维护章节
+  if (EDITOR) { CSS.highlights.clear(); const by = {}; frameLines(by); for (const k in by) CSS.highlights.set(k, by[k]); renderChapters(); return; } // 编辑器模式：只维护章节
   readHead();
   const md = ta.value;
   items = scan(md, state);

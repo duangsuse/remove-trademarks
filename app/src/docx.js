@@ -129,11 +129,11 @@ function runFmt(r, style) {
 
 // ---------- Markdown 构建 ----------
 class MD {
-  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; }
+  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; this.imgs = []; }
   push(str, pid, off, ed) { for (let i = 0; i < str.length; i++) { this.out.push(str[i]); this.pid.push(pid); this.off.push(off); this.ed.push(ed); } }
   s(str) { this.push(str, -1, 0, 0); }
   sp(str, para, off) { this.push(str, para.idx, off, 0); }
-  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = n; }
+  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = n; this.imgs = this.imgs.filter((x) => x.e <= n); }
   get length() { return this.out.length; }
 }
 const marker = (f) => (f === 'bi' ? '***' : f === 'b' ? '**' : '*');
@@ -146,12 +146,15 @@ function emitUnit(md, u, lineStart = false) {
   u.atoms.forEach((a, i) => { if (ESC.has(a.ch)) md.push('\\', u.idx, i, 0); md.push(a.ch, u.idx, i, 1); });
 }
 
-function emitObj(md, para, i, o) {
+// 图片 / 图表 / SmartArt：整段 ![alt](路径) 记进 md.imgs。只能整体删除或整体移动（见 Edits.dropObj / IMG_TOKEN），不能新增
+function emitObj(md, para, i, o, locked) {
+  const s = md.length;
   md.sp('![', para, i);
   if (o.alt) emitUnit(md, o.alt); else md.sp(o.label, para, i);
   md.sp('](' + o.path, para, i + 1);
   if (o.title) { md.sp(' "', para, i + 1); emitUnit(md, o.title); md.sp('"', para, i + 1); }
   md.sp(')', para, i + 1);
+  md.imgs.push({ s, e: md.length, pid: para.idx, off: i, path: o.path, part: para.part, locked: !!locked });
 }
 
 function emitPara(md, para, prefix = '', lineStart = false) {
@@ -177,7 +180,7 @@ function emitPara(md, para, prefix = '', lineStart = false) {
       if (eff[i]) md.sp(marker(eff[i]), para, i);
       fmt = eff[i];
     }
-    if (a.obj) emitObj(md, para, i, a.obj);
+    if (a.obj) emitObj(md, para, i, a.obj, a.locked);
     else if (a.edit) {
       if (ESC.has(a.ch)) md.sp('\\', para, i);
       md.push(a.ch, para.idx, i, 1);
@@ -252,11 +255,23 @@ const hasText = (el) => [...el.childNodes].some((c) => (c.nodeType === 3 ? c.dat
 const UNHANDLED_NOTE = { oMath: '公式', oMathPara: '公式', ruby: '注音', altChunk: '嵌入的外部文档', object: 'OLE 对象' };
 
 // ---------- 编辑记录 ----------
+// 插入文本里的 ![..](路径)：不是新增图片，而是移动（放回被删掉的同路径图片）或复制（克隆文档里已有的同路径图片）。文本里换成 OBJ，路径按顺序记进 refs，保存时再配对
+const OBJ = '\uFFFC';
+const IMG_TOKEN = /!\[(?:\\[\s\S]|[^\]\\])*\]\(([^\s)"]+)(?: "(?:\\[\s\S]|[^"\\])*")?\)/g;
 class Edits extends Map {
-  of(pid) { let e = this.get(pid); if (!e) this.set(pid, (e = { del: new Set(), ins: new Map() })); return e; }
+  dropped = []; // 被整体删除的图片 { pid, off, path, part }，没被配对到插入处的就是真删除
+  of(pid) { let e = this.get(pid); if (!e) this.set(pid, (e = { del: new Set(), ins: new Map(), drop: new Set(), refs: new Map(), nodes: new Map() })); return e; }
   del(pid, off) { this.of(pid).del.add(off); }
-  ins(pid, at, text) { const e = this.of(pid); e.ins.set(at, (e.ins.get(at) || '') + text); }
+  ins(pid, at, text) {
+    const e = this.of(pid), refs = e.refs.get(at) || [];
+    text = text.replace(IMG_TOKEN, (_, path) => { refs.push(path); return OBJ; });
+    if (refs.length) e.refs.set(at, refs);
+    e.ins.set(at, (e.ins.get(at) || '') + text);
+  }
+  dropObj(img) { const e = this.of(img.pid); if (!e.drop.has(img.off)) { e.drop.add(img.off); this.dropped.push(img); } }
 }
+// md 区间 [a, b) 整个包住的图片（只包住一半的不算：结构字符不可编辑）
+const coveredImgs = (images, a, b) => images.filter((x) => !x.locked && x.s >= a && x.e <= b);
 const unmark = (s) => s.replace(/\\([\s\S])|\*+/g, (m, c) => c ?? '').replace(/<br>/g, '\n');
 
 // md 位置 p 处插入：挂到前一个字之后，否则挂到后一个字之前；结构位置（不属于任何单元）返回 null
@@ -267,12 +282,14 @@ function insertAnchor(map, p) {
 }
 
 // diff -> 每段编辑。newMap：新文本也是某个 docx 的投影时传入——插入文字只取其中「可编辑字符」，转义反斜杠 / 粗斜体标记 / 表格竖线 / 换行等结构字符不会混进来
-function computeEdits(origMd, newMd, map, newMap, edits) {
+function computeEdits(origMd, newMd, map, newMap, edits, images = []) {
   const stats = { del: 0, ins: 0, skipped: 0 };
   const del = (a, b) => {
     let any = false;
-    for (let i = a; i < b; i++) if (map.pid[i] >= 0 && map.ed[i]) { edits.del(map.pid[i], map.off[i]); any = true; }
-    if (any) stats.del++; else stats.skipped++;
+    const gone = coveredImgs(images, a, b); // 整张图片被删：连说明文字一起不动（移动时说明文字要跟着走）
+    for (const x of gone) edits.dropObj(x);
+    for (let i = a; i < b; i++) if (map.pid[i] >= 0 && map.ed[i] && !gone.some((x) => i >= x.s && i < x.e)) { edits.del(map.pid[i], map.off[i]); any = true; }
+    if (any || gone.length) stats.del++; else stats.skipped++;
   };
   const ins = (p, text, np, raw) => {
     if (newMap) { let t = ''; for (let i = 0; i < text.length; i++) if (newMap.ed[np + i]) t += text[i]; text = t; }
@@ -335,6 +352,7 @@ function applyParaEdits(para, ed, ctx) {
   const need = new Set();
   const lastIdx = atoms.length - 1;
   for (const i of ed.del) if (atoms[i]?.edit) need.add(atoms[i].r);
+  for (const i of ed.drop) need.add(atoms[i].r);
   for (const at of ed.ins.keys()) need.add(atoms[Math.min(at, lastIdx)].r);
   const rprClones = new Map();
   for (const a of atoms) if (!rprClones.has(a.r)) rprClones.set(a.r, kid(a.r, 'rPr')?.cloneNode(true) || null);
@@ -347,13 +365,15 @@ function applyParaEdits(para, ed, ctx) {
     nr.appendChild(child);
     return nr;
   };
-  // 插入文本里的 \n 写成 <w:br/>（点即换行）
+  // 插入文本里的 \n 写成 <w:br/>、\t 写成 <w:tab/>（点即换行 / 制表）；OBJ 处放回被移动的图片（ed.nodes，已在 save 里配好对）
   const insNode = (r, gi, text) => {
-    const runs = [];
-    text.split('\n').forEach((part, i) => {
-      if (i) runs.push(mkRun(r, rprOfAtom(gi), mkEl(doc, 'br')));
-      if (part) runs.push(mkRun(r, rprOfAtom(gi), mkText(doc, 't', part)));
-    });
+    const runs = [], objs = [...(ed.nodes.get(gi) || [])];
+    for (const part of text.split(/([\n\t\uFFFC])/)) {
+      if (part === '\n') runs.push(mkRun(r, rprOfAtom(gi), mkEl(doc, 'br')));
+      else if (part === '\t') runs.push(mkRun(r, rprOfAtom(gi), mkEl(doc, 'tab')));
+      else if (part === OBJ) { const n = objs.shift(); if (n) runs.push(n); }
+      else if (part) runs.push(mkRun(r, rprOfAtom(gi), mkText(doc, 't', part)));
+    }
     if (!ctx.track) return runs;
     const w = mkEl(doc, 'ins', meta());
     runs.forEach((x) => w.appendChild(x));
@@ -362,7 +382,7 @@ function applyParaEdits(para, ed, ctx) {
   const delNode = (r, rpr, text) => {
     if (!ctx.track) return null;
     const w = mkEl(doc, 'del', meta());
-    w.appendChild(mkRun(r, rpr, mkText(doc, 'delText', text)));
+    w.appendChild(mkRun(r, rpr, typeof text !== 'string' ? text : mkText(doc, 'delText', text))); // 制表符 / 图片整个 run 包进 w:del
     return w;
   };
   let dropped = 0;
@@ -379,9 +399,10 @@ function applyParaEdits(para, ed, ctx) {
       const list = byItem.get(c);
       if (!list) { push(mkRun(r, rpr, c.cloneNode(true))); continue; }
       if (!isW(c, 't')) {
-        for (const [, gi] of list) {
+        for (const [a, gi] of list) {
           if (ed.ins.has(gi)) push(insNode(r, gi, ed.ins.get(gi)));
-          push(mkRun(r, rpr, c.cloneNode(true)));
+          if ((a.edit && ed.del.has(gi)) || ed.drop.has(gi)) push(delNode(r, rpr, c.cloneNode(true))); // 制表符 / 图片：删除（审阅模式下是删除线）
+          else push(mkRun(r, rpr, c.cloneNode(true)));
           if (gi === lastIdx && ed.ins.has(atoms.length)) push(insNode(r, atoms.length, ed.ins.get(atoms.length)));
         }
         continue;
@@ -410,7 +431,7 @@ function applyParaEdits(para, ed, ctx) {
 function applyTextEdits(u, ed) {
   let s = '';
   u.atoms.forEach((a, i) => { s += ed.ins.get(i) ?? ''; if (!ed.del.has(i)) s += a.ch; });
-  s = (s + (ed.ins.get(u.atoms.length) ?? '')).replace(/\n/g, ' ');
+  s = (s + (ed.ins.get(u.atoms.length) ?? '')).replace(/\n/g, ' ').replace(/\uFFFC/g, ''); // 属性文字里放不了图片
   u.set(s);
   return s;
 }
@@ -459,6 +480,7 @@ export class DocxProjection {
   textParts = []; // 正文 + 页眉页脚脚注尾注
   units = []; // 段落 {kind:'para', el, part, atoms} 或文本单元 {kind:'text', part, atoms, set}
   md = '';
+  images = []; // 图片 / 图表 / SmartArt 在 md 里的整段 [{s, e, pid, off, path, part, locked}]
   map = null; // md 每个字符 -> {pid 单元, off 单元内位置, ed 可编辑}
   warnings = [];
   unhandled = []; // 投影不了的元素 [{tag: 'm:oMath', count}]，也会汇总进 warnings
@@ -499,17 +521,20 @@ export class DocxProjection {
         continue;
       }
       let first = -1;
-      for (let i = s; i < e; i++) if (ed[i]) { if (first < 0) first = i; this.#edits.del(pid[i], off[i]); }
-      if (first < 0) { st.skipped++; continue; }
+      const gone = coveredImgs(this.images, s, e);
+      for (const x of gone) this.#edits.dropObj(x);
+      for (let i = s; i < e; i++) if (ed[i] && !gone.some((x) => i >= x.s && i < x.e)) { if (first < 0) first = i; this.#edits.del(pid[i], off[i]); }
+      if (first < 0 && !gone.length) { st.skipped++; continue; }
       st.del++;
-      if (text) { this.#edits.ins(pid[first], off[first], text); st.ins++; }
+      const at = first >= 0 ? [pid[first], off[first]] : insertAnchor(this.map, s);
+      if (text && at) { this.#edits.ins(at[0], at[1], text); st.ins++; }
     }
     return this.#count(st);
   }
 
   // 与新 md 做 diff；from：新文本来自另一个 DocxProjection 时传入，结构字符不会写进正文
   applyText(newMd, { from = null } = {}) {
-    return this.#count(computeEdits(this.md, newMd, this.map, from?.map, this.#edits).stats);
+    return this.#count(computeEdits(this.md, newMd, this.map, from?.map, this.#edits, this.images).stats);
   }
 
   // 用函数改纯文本投影：fn(text) -> 新 text，差异写回。range=[s, e]（md 坐标，如 lineRange(d.md, 11, 22)）时 fn 只拿到这一段。
@@ -529,6 +554,7 @@ export class DocxProjection {
     const ctx = { author, date: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), nextId: maxId(this.textParts) + 1, track };
     const edited = [], mirror = new Map();
     let untracked = 0, failed = 0;
+    const added = this.#pairImages(ctx);
     for (const [pid, ed] of this.#edits) {
       const u = this.units[pid];
       if (u.kind === 'text') {
@@ -548,6 +574,7 @@ export class DocxProjection {
         u.el.replaceWith(backup); // 半途失败的段落整段还原
       }
     }
+    if (added) { warnings.push(`${added} 处新增图片被忽略（图片只能删除、移动或复制文档里已有的：路径须与原图相同，且在同一部分——正文 / 页眉等不能互相搬）`); stats.ins = Math.max(0, stats.ins - added); stats.skipped += added; }
     if (untracked) warnings.push(`${untracked} 处链接地址 / 图片说明 / 图表文字无法写成修订，未改动`);
     if (failed) { warnings.push(`${failed} 段写入失败（详见控制台），这些段落保持原样`); stats.skipped += failed; }
     syncFallbacks(edited);
@@ -569,6 +596,36 @@ export class DocxProjection {
     if (this.#wipe) await wipeFingerprints(this.zip);
     const out = await this.zip.generateAsync({ type, compression: 'DEFLATE', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
     return { [type === 'blob' ? 'blob' : 'data']: out, stats, warnings };
+  }
+
+  // 插入文本里的图片引用：优先配对到被删掉的同路径图片（同一部件内，按出现顺序）= 移动；
+  // 没有可配的就复制文档里已有的同路径图片（关系 / 媒体文件现成，克隆 drawing 即可）；都没有的是新增，忽略。返回被忽略的个数。没被放回的被删图片就是真删除
+  #pairImages(ctx) {
+    const objRun = (img) => {
+      const a = this.units[img.pid].atoms[img.off], r = a.r.cloneNode(false), rpr = kid(a.r, 'rPr');
+      if (rpr) r.appendChild(rpr.cloneNode(true));
+      r.appendChild(a.item.cloneNode(true));
+      return r;
+    };
+    const gone = this.#edits.dropped.map((img) => ({ img, r: objRun(img), used: false }));
+    let ignored = 0, docPr = 0; // wp:docPr 的 id（与 w:id 是两套编号）
+    for (const part of this.textParts) for (const el of part.doc.getElementsByTagNameNS(WP_NS, 'docPr')) docPr = Math.max(docPr, +el.getAttribute('id') || 0);
+    const renew = (r) => { for (const el of r.getElementsByTagNameNS(WP_NS, 'docPr')) el.setAttribute('id', String(++docPr)); };
+    for (const [pid, ed] of this.#edits) {
+      for (const [at, paths] of ed.refs) {
+        const u = this.units[pid], nodes = [];
+        for (const path of paths) {
+          const same = (x) => x.path === path && x.part === u.part;
+          const move = u.kind === 'para' && gone.find((x) => !x.used && same(x.img));
+          if (move) { move.used = true; if (ctx.track) renew(move.r); nodes.push(move.r); continue; } // 审阅模式下原图留在删除线里，副本换新 id
+          const src = u.kind === 'para' && this.images.find(same);
+          if (!src) { ignored++; nodes.push(null); continue; }
+          const r = objRun(src); renew(r); nodes.push(r); // 复制：原图还在，必须换新 id
+        }
+        ed.nodes.set(at, nodes);
+      }
+    }
+    return ignored;
   }
 
   #count(st) { for (const k in st) this.stats[k] += st[k]; return st; }
@@ -660,7 +717,7 @@ export class DocxProjection {
           if (c.namespaceURI !== NS) { stray(c); continue; }
           switch (c.localName) {
             case 't': for (const ch of c.textContent) atoms.push({ ...base, ch, edit: !locked }); break;
-            case 'tab': atoms.push({ ...base, ch: '\t', edit: false }); break;
+            case 'tab': atoms.push({ ...base, ch: '\t', edit: !locked }); break;
             case 'br': case 'cr': atoms.push({ ...base, ch: '\n', edit: false }); break;
             case 'noBreakHyphen': atoms.push({ ...base, ch: '-', edit: false }); break;
             case 'drawing': case 'pict': obj(c); break;
@@ -827,6 +884,7 @@ export class DocxProjection {
     const vec = Object.keys(zip.files).filter((p) => /^word\/media\/[^/]+\.(?:svg|emf|wmf|tiff?)$/i.test(p));
     if (vec.length) warnings.push(`有 ${vec.length} 张 svg / emf 等格式的图片不能替换成占位图（svg 常与同名 png 成对，只换 png 时 Word 仍显示 svg）`);
 
+    this.images = md.imgs;
     this.md = md.out.join('');
     this.map = { pid: Int32Array.from(md.pid), off: Int32Array.from(md.off), ed: Uint8Array.from(md.ed) };
   }
