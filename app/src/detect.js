@@ -1,44 +1,11 @@
-// 规则执行：扫描 Markdown → 候选项；选区解析；替换；章节。规则本身见 rules.js
+// 规则执行：扫描 Markdown → 候选项；选区；替换；章节。规则本身见 rules.js，投影结构见 markup.js，输入框格式见 boxes.js
 import { RULES, ABBR_MAX, ABBR_RE, NAME_LABELS, NAME_VALUE, NAME_STOP, NER_GROUPS, CHAPTER_FALLBACK } from './rules.js';
-import { MARK } from './docx.js';
+import { readLines } from './markup.js';
+import { lineRule } from './boxes.js';
+import { plainView, unmark } from './plain.js';
 
-// 去掉 Markdown 标记（转义反斜杠、粗斜体 *）后的文字，像 innerText
-export const unmark = (s) => s.replace(/\\([\s\S])|\*+/g, (m, c) => c ?? '');
-
-// 纯文本视图：text 为去掉标记后的文字，idx[k] 为 text[k] 在 md 中的位置。规则 / 黑名单 / NER 都在视图上匹配，
-// 这样「张**三**」也能命中「张三」；命中区间再换回 md 坐标（会把中间的标记一并包进去）
-let viewOf = { md: null, v: null };
-export function plainView(md) {
-  if (viewOf.md === md) return viewOf.v;
-  const out = [], idx = new Int32Array(md.length + 1), esc = new Uint8Array(md.length + 1); // esc[k]：text[k] 在 md 里带转义反斜杠
-  for (let i = 0; i < md.length; i++) {
-    const c = md[i];
-    if (c === '\\' && i + 1 < md.length) { esc[out.length] = 1; idx[out.length] = ++i; out.push(md[i]); }
-    else if (c !== '*') { idx[out.length] = i; out.push(c); }
-  }
-  const n = out.length;
-  idx[n] = md.length;
-  const lower = (pos) => { let a = 0, b = n; while (a < b) { const m = (a + b) >> 1; if (idx[m] < pos) a = m + 1; else b = m; } return a; };
-  const v = {
-    text: out.join(''),
-    toMd: (s, e) => [idx[s] - esc[s], e > s ? idx[e - 1] + 1 : idx[s]], // 视图区间 -> md 区间（以转义字符开头时连反斜杠一起）
-    slice: (s, e) => v.text.slice(lower(s), lower(e)), // md 区间 -> 视图文字
-  };
-  viewOf = { md, v };
-  return v;
-}
-export const plainOf = (md, s, e) => plainView(md).slice(s, e);
-
-// 对 md 应用区间替换 [{s, e, text}]（已按 s 排序、不重叠）。区间里的粗斜体标记原样留下，
-// 否则「张**三**」命中「张**三」时会剩下落单的 **
-export function spliceMd(md, reps) {
-  let out = '', p = 0;
-  for (const x of reps) { out += md.slice(p, x.s) + x.text + md.slice(x.s, x.e).replace(/\\[\s\S]|[^*]/g, ''); p = x.e; }
-  return out + md.slice(p);
-}
-
-// 送给 NER 的行：与 md 行一一对应；结构行（表格分隔、特殊表格边界、分隔线）置空，表格竖线换成空格
-export const nerLines = (md) => plainView(md).text.split('\n').map((l) => (/^(?::::|---|\|[ |-]+$)/.test(l) ? '' : l.replace(/\|/g, ' ')));
+// 送给 NER 的行：与 md 行一一对应；结构行置空，表格竖线换成空格
+export const nerLines = (md) => readLines(plainView(md).text).map((l) => (l.structural ? '' : l.text.replace(/\|/g, ' ')));
 
 function findAll(md, text, add) {
   if (!text) return;
@@ -46,42 +13,13 @@ function findAll(md, text, add) {
   while (i >= 0) { add(i, i + text.length); i = md.indexOf(text, i + text.length); }
 }
 
-// 黑名单框的行：普通词，或行号模式 #L11~L222 / #L11
-export function parseBlackLines(lines) {
-  const words = [], ranges = [];
-  for (const l of lines) {
-    const t = l.trim();
-    if (!t) continue;
-    const m = /^#L(\d+)(?:\s*~\s*L?(\d+))?$/i.exec(t);
-    if (m) ranges.push([+m[1], +(m[2] || m[1])]);
-    else words.push(t);
-  }
-  return { words, ranges };
-}
-
-export function parseCustom(text) {
-  const out = [];
-  for (const ln of text.split('\n')) {
-    const t = ln.trim();
-    if (!t) continue;
-    const i = t.indexOf('::');
-    const name = i >= 0 ? t.slice(0, i).trim() : '自订', src = i >= 0 ? t.slice(i + 2).trim() : t;
-    try { out.push({ name, re: new RegExp(src, 'gu') }); } catch { /* 无效正则忽略 */ }
-  }
-  return out;
-}
-
 // 含姓名的表格：标签格的下一格 / 特殊表格中标签行的下一行
 function tableNames(text, put) {
-  let pos = 0, inSpecial = false, label = false, ln = 0;
+  let label = false;
   const strip = (s) => s.replace(/[：:\s]/g, '');
-  for (const line of text.split('\n')) {
-    const start = pos;
-    pos += line.length + 1; ln++;
-    if (line.startsWith(MARK.special)) { inSpecial = true; label = false; continue; }
-    if (line === MARK.end) { inSpecial = false; label = false; continue; }
-    if (line.startsWith('| ') && line.endsWith(' |')) {
-      if (/^\| (?:--- \| )+$|^\|(?: --- \|)+$/.test(line)) continue;
+  for (const { text: line, s: start, n: ln, kind } of readLines(text)) {
+    if (kind === 'open' || kind === 'close') { label = false; continue; }
+    if (kind === 'table') {
       let p = start + 2, prevLabel = false;
       for (const cell of line.slice(2, -2).split(' | ')) {
         const t = strip(cell);
@@ -89,7 +27,7 @@ function tableNames(text, put) {
         prevLabel = NAME_LABELS.test(t);
         p += cell.length + 3;
       }
-    } else if (inSpecial) {
+    } else if (kind === 'cell') {
       const t = strip(line);
       if (label && NAME_VALUE.test(t) && !NAME_STOP.test(t)) put(t, start, start + line.length, ln); // 特殊表格 1 格 1 行：按行号删，和章节一样
       label = NAME_LABELS.test(t);
@@ -99,12 +37,14 @@ function tableNames(text, put) {
 
 // 模型常见的无效碎片：只剩公司后缀（"限公司"、"技有限公司"）、括号不成对（"中国）有限公司"）
 const SUFFIX_ONLY = /^.{0,1}?(?:股份)?(?:有限责任|有限)?公司$/;
-const ORGISH = new Set(['ORG', 'FAC', 'GPE', 'LOC']), NUM_TYPES = new Set(['DATE', 'MONEY', 'PERCENT']);
+const ORGISH = new Set(['ORG', 'FAC', 'GPE', 'LOC']);
 const junkNer = (t) => SUFFIX_ONLY.test(t) || !/[A-Za-z\u4e00-\u9fff]{2}/.test(t) || (t.match(/[（(]/g) || []).length !== (t.match(/[）)]/g) || []).length; // 另：至少要有连续 2 个字母/汉字（过滤 "137"、".0"）
 
+// st：{ cats, blacklist: [词], ranges: [[a, b]], custom: [{name, re}], ner: [{text, type, score}], nerMin }，都可省略
 // 返回 Map(key -> {key,text,cat,en,cls,warn,type,grp,score,occ:[[s,e]]})，不受勾选影响（勾选由调用方过滤，便于显示 ({num})）
 // 匹配在纯文本视图上做，occ 最后换成 md 坐标
-export function scan(md0, st) {
+export function scan(md0, st0 = {}) {
+  const st = { blacklist: [], ranges: [], custom: [], ner: [], ...st0 };
   const view = plainView(md0), md = view.text;
   const items = new Map();
   const put = (key, text, meta, s, e) => {
@@ -144,7 +84,7 @@ export function scan(md0, st) {
     for (const [a, b] of st.ranges) {
       if (a < 1 || a > starts.length) continue;
       const bb = Math.min(b, starts.length), s = starts[a - 1], e = bb < starts.length ? starts[bb] - 1 : md.length;
-      if (e > s) put('rng:' + a + '~' + bb, `#L${a}~L${bb}`, { cat: 'black', en: 'black', cls: 'black', del: true }, s, e);
+      if (e > s) put('rng:' + a + '~' + bb, lineRule.dump(a, bb), { cat: 'black', en: 'black', cls: 'black', del: true }, s, e);
     }
   }
   ABBR_RE.lastIndex = 0;
@@ -152,14 +92,22 @@ export function scan(md0, st) {
   for (const m of md.matchAll(ABBR_RE)) abbr.add(m[1]);
   for (const w of abbr) findAll(md, w, (s, e) => put('abbr:' + w, w, { cat: 'abbr', en: 'abbr', cls: 'abbr' }, s, e));
   tableNames(md, (t, s, e, ln) => (ln
-    ? put('tbl:#L' + ln, '#L' + ln, { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true, del: true, show: t }, s, e)
+    ? put('tbl:' + lineRule.dump(ln), lineRule.dump(ln), { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true, del: true, show: t }, s, e)
     : put('tbl:' + t, t, { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true }, s, e)));
   // 模型只做兜底召回：规则 / 黑名单已识别的公司、地址里的碎片（"件有限公司"、"东华软"）不再重复列出
   const anchors = [...items.values()].filter((it) => it.cat === 'company' || it.cat === 'addr' || it.cat === 'black').map((it) => it.text);
   const cats = st.cats || {}, minScore = st.nerMin || 0, nerAll = st.ner.filter((n) => n.score >= minScore);
   // NER 校验正则：公司／地址正则命中处没有任何 机构/设施/地名 实体与之重叠 → 标成存疑（warn，默认不选）
+  // 另：正则从左边界一路匹配过来，常把前面的话也吞进去（「委托北京某某有限公司」）——若某 NER 实体正好是命中文本的真后缀，则把左端截到实体处
   if (cats.ner_verify) {
-    const orgish = nerAll.filter((n) => ORGISH.has(n.type));
+    const orgish = nerAll.filter((n) => ORGISH.has(n.type) && n.text.length >= 4 && !junkNer(n.text));
+    for (const it of [...items.values()]) {
+      if (it.cat !== 'company' && it.cat !== 'addr') continue;
+      const n = orgish.filter((x) => x.text.length < it.text.length && it.text.endsWith(x.text)).sort((a, b) => b.text.length - a.text.length)[0];
+      if (!n) continue;
+      items.delete(it.key);
+      for (const [, e] of it.occ) put(it.cat + ':' + n.text, n.text, { cat: it.cat, en: it.en, cls: it.cls, warn: it.warn }, e - n.text.length, e);
+    }
     const ovl = (it) => orgish.some((n) => n.text.includes(it.text) || it.text.includes(n.text));
     for (const it of items.values()) if ((it.cat === 'company' || it.cat === 'addr') && !ovl(it)) { it.warn = true; it.cls = 'warn'; it.weak = true; }
   }
@@ -174,14 +122,15 @@ export function scan(md0, st) {
       }
     }
   }
-  // NER 日期/数量/金额：补正则漏掉的（已被其他条目包含的不再列）
-  if (cats.ner_num) {
+  // NER 日期 / 金额 / 百分比：补正则漏掉的（已被其他条目包含的不再列）。百分比随「日期和百分比」开关；进人名地名面板（grp: place）
+  const numOn = { DATE: cats.ner_date, MONEY: cats.ner_money, PERCENT: cats.date }, numEn = { DATE: 'ner_date', MONEY: 'ner_money', PERCENT: 'date' };
+  if (numOn.DATE || numOn.MONEY || numOn.PERCENT) {
     const have = [...items.values()].map((it) => it.text);
     for (const n of nerAll) {
-      if (!NUM_TYPES.has(n.type) || n.text.length < 2 || !/[0-9０-９一二三四五六七八九十百千万亿零〇]/.test(n.text)) continue;
+      if (!numOn[n.type] || n.text.length < 2 || !/[0-9０-９一二三四五六七八九十百千万亿零〇]/.test(n.text)) continue;
       const key = 'ner:' + n.text;
       if (items.has(key) || have.some((h) => h.includes(n.text))) continue;
-      findAll(md, n.text, (s, e) => put(key, n.text, { cat: 'ner', en: 'ner_num', cls: 'date', type: n.type, grp: 'cand', score: n.score }, s, e));
+      findAll(md, n.text, (s, e) => put(key, n.text, { cat: 'ner', en: numEn[n.type], cls: 'date', type: n.type, grp: 'place', score: n.score }, s, e));
     }
   }
   for (const n of nerAll) {
@@ -197,18 +146,13 @@ export function scan(md0, st) {
   return items;
 }
 
-export function parseRules(text) {
-  const rules = [];
-  for (const ln of text.split('\n')) {
-    const i = ln.indexOf('=>');
-    if (i < 0) continue;
-    let re = ln.slice(0, i).trim();
-    const rep = ln.slice(i + 2).trim(), pre = /^::([^:]+)::\s*/.exec(re); // ::cname:: 前缀：只作用于该类别（cat / en / NER 类型）
-    if (pre) re = re.slice(pre[0].length);
-    if (!re) continue;
-    try { rules.push({ test: new RegExp('^(?:' + re + ')$'), re: new RegExp(re, 'g'), rep, only: pre ? pre[1].trim() : '' }); } catch { /* 忽略无效规则 */ }
-  }
-  return rules;
+// scan 的异步版：ner 是函数 (lines) => Promise<[{text, type, score}]>（如 ner.recognize），不传则只用规则 / 黑名单。
+// range=[s, e]（md 坐标）时只送这段给 NER，规则照常全文扫描
+export async function detect(md, st = {}, { ner, range } = {}) {
+  if (!ner) return scan(md, st);
+  const lines = nerLines(md);
+  if (range) { const a = md.slice(0, range[0]).split('\n').length - 1, b = md.slice(0, range[1]).split('\n').length; lines.forEach((_, i) => { if (i < a || i >= b) lines[i] = ''; }); }
+  return scan(md, { ...st, ner: [...(st.ner || []), ...(await ner(lines))] });
 }
 
 // 替换模板：{表达式} 只认白名单写法（不执行任意代码）：s（命中文本）、$m（匹配数组）、kind（类别显示名），可接 [n] / .length / .slice(a,b)；
@@ -259,27 +203,19 @@ export function selection(items, isOn) {
 
 // 章节：优先 # 标题，没有则按编号回退；范围到下一个同级或更高级标题（或"其他文本"区）之前
 export function chapters(md) {
-  const cut = md.indexOf('\n' + MARK.others);
-  const body = cut >= 0 ? md.slice(0, cut + 1) : md;
-  const lines = [];
-  let pos = 0;
-  for (const l of body.split('\n')) { lines.push([l, pos]); pos += l.length + 1; }
+  const all = readLines(md), lines = all.filter((l) => !l.others);
   let heads = [];
-  for (const [l, s] of lines) { const m = /^(#{1,6}) (.+)$/.exec(l); if (m) heads.push({ level: m[1].length, title: unmark(m[2]), s }); }
+  for (const { text, s } of lines) { const m = /^(#{1,6}) (.+)$/.exec(text); if (m) heads.push({ level: m[1].length, title: unmark(m[2]), s }); }
   if (heads.length < 3) { // 样式标题太少（常见于手工排版的申报书）：叠加按编号识别
     const have = new Set(heads.map((h) => h.s));
-    let inSpecial = false;
-    for (const [l, s] of lines) {
-      if (l.startsWith(MARK.special)) inSpecial = true;
-      else if (l === MARK.end) inSpecial = false;
-      if (inSpecial || have.has(s)) continue;
-      if (!l || l.startsWith('|') || l.startsWith(':::') || l.length > 40 || /[。；;，,]$/.test(l)) continue;
-      const plain = unmark(l);
+    for (const { text, s, kind } of lines) {
+      if (kind !== 'text' || have.has(s) || !text || text.length > 40 || /[。；;，,]$/.test(text)) continue;
+      const plain = unmark(text);
       for (const [re, lv] of CHAPTER_FALLBACK) { const m = re.exec(plain); if (m) { heads.push({ level: lv(m), title: plain, s }); break; } }
     }
     heads.sort((a, b) => a.s - b.s);
   }
-  const end = cut >= 0 ? cut + 1 : md.length;
+  const end = all.find((l) => l.others)?.s ?? md.length;
   heads.forEach((h, i) => {
     let e = end;
     for (let j = i + 1; j < heads.length; j++) if (heads[j].level <= h.level) { e = heads[j].s; break; }

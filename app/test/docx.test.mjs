@@ -8,8 +8,12 @@ import JSZip from 'jszip';
 const { window } = new JSDOM('');
 globalThis.DOMParser = window.DOMParser;
 globalThis.XMLSerializer = window.XMLSerializer;
-const { DocxProjection, TOOL_AUTHOR } = await import('../src/docx.js');
-const { scan, selection, replacement, parseRules, chapters, plainOf, nerLines, spliceMd } = await import('../src/detect.js');
+const { DocxProjection } = await import('../src/docx.js');
+const { scan, detect, selection, replacement, chapters, nerLines } = await import('../src/detect.js');
+const { parseRules, BlackBox } = await import('../src/boxes.js');
+const { plainOf, spliceMd, lineRange } = await import('../src/plain.js');
+const { MARK, PROJECTION, makeMarks, partnerOf } = await import('../src/markup.js');
+const TOOL_AUTHOR = PROJECTION.author;
 
 const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
 const DRAW = 'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:v="urn:schemas-microsoft-com:vml"';
@@ -18,7 +22,7 @@ const t = (s, b) => `<w:r>${b ? '<w:rPr><w:b/></w:rPr>' : ''}<w:t xml:space="pre
 const p = (body, pPr = '') => `<w:p>${pPr ? `<w:pPr>${pPr}</w:pPr>` : ''}${body}</w:p>`;
 const txbx = (s) => `<w:txbxContent>${p(t(s))}</w:txbxContent>`;
 
-async function sample() {
+async function sample(extra = '') {
   const z = new JSZip();
   z.file('[Content_Types].xml', '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>');
   z.file('_rels/.rels', `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}officeDocument" Target="word/document.xml"/></Relationships>`);
@@ -45,7 +49,7 @@ async function sample() {
     p(`<w:r><w:drawing><wp:inline><wp:docPr id="2" name="图表 1"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rC"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`),
     p(`<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><wp:docPr id="3" name="文本框 1"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:txbx>${txbx('框里的张三')}</wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox>${txbx('框里的张三')}</v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>`),
     `<w:tbl><w:tr><w:tc>${p(t('姓名'))}</w:tc><w:tc>${p(t('张三'))}</w:tc></w:tr><w:tr><w:tc>${p(t('a|b'))}</w:tc><w:tc>${p(t('x*y'))}</w:tc></w:tr></w:tbl>`,
-  ].join('');
+  ].join('') + extra;
   z.file('word/document.xml', `<?xml version="1.0"?><w:document ${W} ${DRAW}><w:body>${body}<w:sectPr/></w:body></w:document>`);
   return z.generateAsync({ type: 'uint8array' });
 }
@@ -56,7 +60,9 @@ async function allText(data) {
   for (const f of Object.values(z.files)) if (!f.dir && /\.(xml|rels)$/.test(f.name)) s += await f.async('string');
   return s;
 }
-const st = (words) => ({ cats: {}, blacklist: words, ranges: [], custom: [], ner: [] });
+const st = (words) => ({ blacklist: words });
+// 解析 → 修改 → 保存 → 重新解析
+const roundTrip = async (d, opts) => DocxProjection.load((await d.save({ type: 'uint8array', ...opts })).data);
 
 test('投影：标题样式、编号、链接、图片、图表、文本框、表格、转义', async () => {
   const d = await DocxProjection.load(await sample());
@@ -144,7 +150,7 @@ test('含姓名表格：姓名中间有空白时整段命中', () => {
 });
 
 test('nerLines：只清空表格分隔行，纯 ASCII 的表格行照常送 NER', () => {
-  assert.deepEqual(nerLines('| --- | --- |\n| John Smith | IBM Corp |\n:::\n---'), ['', '  John Smith   IBM Corp  ', '', '']);
+  assert.deepEqual(nerLines(`| --- | --- |\n| John Smith | IBM Corp |\n${MARK.open}x\n${MARK.close}\n---`), ['', '  John Smith   IBM Corp  ', '', '', '']);
 });
 
 test('spliceMd：跨粗体的命中替换后标记仍成对；以转义字符开头的命中带上反斜杠', () => {
@@ -194,4 +200,112 @@ test('样例申报书：标题按样式识别，替换后可再解析', { skip: 
   console.log('样例：', sel.length, '处', stats, warnings);
   const d2 = await DocxProjection.load(data);
   assert.ok(d2.md.length > 1000);
+});
+
+// ---------- round-trip：只经过 load / replace / applyText / editText / save 这些边界 ----------
+const MERGED = `<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr>${p(t('基本信息'))}</w:tc></w:tr><w:tr><w:tc>${p(t('联系人'))}</w:tc><w:tc>${p(t('王五'))}</w:tc></w:tr></w:tbl>`;
+
+test('editText：用函数改纯文本投影，保存后重新解析，纯文本 = 原纯文本经同一函数', async () => {
+  const d = await DocxProjection.load(await sample());
+  const fn = (s) => s.replaceAll('张三', '李四');
+  const want = fn(d.text);
+  const st = d.editText(fn);
+  assert.equal(st.skipped, 0);
+  const d2 = await roundTrip(d);
+  assert.equal(d2.text, want);
+  assert.match(d2.md, /联系人：李四，/, '跨粗体的「张**三**」整体换掉，不留落单的 **');
+});
+
+test('editText：纯插入、纯删除', async () => {
+  const d = await DocxProjection.load(await sample());
+  d.editText((s) => s.replace('联系人：', '联系人（已核实）：').replace('，电话 13912345678', ''));
+  const d2 = await roundTrip(d);
+  assert.match(d2.md, /^联系人（已核实）：张\*\*三\*\*$/m);
+});
+
+test('editText range：只改选区（第 n 行），其余行不动', async () => {
+  const d = await DocxProjection.load(await sample());
+  const lines = d.md.split('\n'), n = lines.findIndex((l) => l.startsWith('联系人')) + 1;
+  d.editText((s) => s.replaceAll('张', '某'), { range: lineRange(d.md, n) });
+  const d2 = await roundTrip(d);
+  assert.match(d2.md, /^联系人：某\*\*三\*\*/m);
+  assert.match(d2.md, /写信给张三/, '选区外不改');
+});
+
+test('applyText：改过的 md 写回（如外部编辑器改完的 .md 文件）', async () => {
+  const d = await DocxProjection.load(await sample());
+  const edited = d.md.replace('第一项', '第 1 项').replace('页眉 张三', '页眉');
+  d.applyText(edited);
+  const d2 = await roundTrip(d);
+  assert.equal(d2.md, edited);
+});
+
+test('审阅修订 round-trip：track 写入后重新载入先撤掉自己的修订，投影回到原文', async () => {
+  const buf = await sample();
+  const d = await DocxProjection.load(buf);
+  d.editText((s) => s.replace('第一项', '第二项'));
+  const again = await roundTrip(d, { track: true });
+  assert.equal(again.md, (await DocxProjection.load(buf)).md);
+});
+
+test('特殊表格：<details>::: 开头、:::</details> 收尾；表格里的姓名按行号命中；章节不收结构行', async () => {
+  const d = await DocxProjection.load(await sample(MERGED));
+  const lines = d.md.split('\n'), a = lines.findIndex((l) => l.startsWith(MARK.open));
+  assert.ok(a >= 0, d.md);
+  assert.deepEqual(lines.slice(a, a + 5), [MARK.open + MARK.openNote, '基本信息', '联系人', '王五', MARK.close]);
+  const items = scan(d.md, st([]));
+  assert.equal(items.get('tbl:#L' + (a + 4)).show, '王五');
+  assert.ok(!chapters(d.md).some((c) => /details|:::/.test(c.title)));
+  const open = d.md.indexOf(MARK.open), close = d.md.indexOf(MARK.close);
+  assert.equal(partnerOf(d.md, open + 3), close, '开头行 → 收尾行');
+  assert.equal(partnerOf(d.md, close), open, '收尾行 → 开头行');
+  assert.equal(partnerOf(d.md, open, close), -1, '选区跨行不跳');
+});
+
+test('正文里以结构标记开头的段落会转义，不会被认成特殊表格', async () => {
+  const d = await DocxProjection.load(await sample(p(t(MARK.open.replace('<', '&lt;') + '正文'))));
+  assert.ok(d.md.includes('\\' + MARK.open + '正文'));
+  assert.ok(!d.md.split('\n').some((l) => l.startsWith(MARK.open)));
+});
+
+test('结构标记 / 修订作者可经 opts 覆盖（投影工具与本项目解耦）', async () => {
+  const marks = makeMarks({ open: '[[表', openNote: '', close: '表]]', others: '## 附', othersNote: '' });
+  const d = await DocxProjection.load(await sample(MERGED), { marks, author: 'me' });
+  assert.match(d.md, /^\[\[表\n基本信息\n联系人\n王五\n表\]\]$/m);
+  assert.match(d.md, /^## 附\n\n### 页眉/m);
+  d.editText((s) => s.replace('王五', '某'));
+  const xml = await allText((await d.save({ track: true, type: 'uint8array' })).data);
+  assert.ok(xml.includes('w:author="me"') && !xml.includes(TOOL_AUTHOR));
+});
+
+test('公式 / 注音 / altChunk：不投影，按标签名列进未处理清单', async () => {
+  const M = 'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"';
+  const extra = p(`${t('面积')}<m:oMath ${M}><m:r><m:t>S=πr²</m:t></m:r></m:oMath>`)
+    + p(`<w:r><w:ruby><w:rt><w:r><w:t>zhāng</w:t></w:r></w:rt><w:rubyBase><w:r><w:t>张</w:t></w:r></w:rubyBase></w:ruby></w:r>`)
+    + '<w:altChunk r:id="rX"/>' + p(`<w:del w:id="1" w:author="x"><w:r><w:delText>删掉的</w:delText></w:r></w:del>${t('留下')}`);
+  const d = await DocxProjection.load(await sample(extra));
+  assert.deepEqual(d.unhandled, [{ tag: 'm:oMath', count: 1 }, { tag: 'w:ruby', count: 1 }, { tag: 'w:altChunk', count: 1 }]);
+  const w = d.warnings.find((x) => x.startsWith('以下元素没有投影'));
+  assert.match(w, /<m:oMath> ×1（公式）\n.*<w:ruby> ×1（注音）\n.*<w:altChunk> ×1/);
+  assert.match(d.md, /^面积$/m);
+});
+
+test('detect：NER 作为函数参数注入（这里用假的）', async () => {
+  const md = '项目由王小明负责。\n王小明的电话 13912345678';
+  const fakeNer = async (lines) => lines.flatMap((l, line) => (l.includes('王小明') ? [{ text: '王小明', type: 'PERSON', score: 0.9, line }] : []));
+  const items = await detect(md, {}, { ner: fakeNer });
+  assert.equal(items.get('ner:王小明').occ.length, 2);
+  assert.ok(items.get('mobile:13912345678'));
+  const only2 = await detect(md, {}, { ner: async (lines) => (assert.deepEqual(lines, ['', '王小明的电话 13912345678']), []), range: lineRange(md, 2) });
+  assert.ok(!only2.has('ner:王小明'));
+});
+
+test('黑名单框：load / dump 互逆；add / remove 按行号区间去重', () => {
+  const text = BlackBox.dump({ own: ['张三', '', '#L3~L5'], synced: ['李四'] });
+  const b = BlackBox.load(text);
+  assert.deepEqual([b.entries, b.synced, b.words, b.ranges], [['张三', '#L3~L5'], ['李四'], ['张三'], [[3, 5]]]);
+  assert.equal(BlackBox.dump(b), text);
+  assert.equal(BlackBox.add(text, '#l3 ~ L5'), text, '同一区间不重复加');
+  assert.deepEqual(BlackBox.load(BlackBox.add(text, '王五')).entries, ['张三', '#L3~L5', '王五']);
+  assert.deepEqual(BlackBox.load(BlackBox.remove(text, '#L3~5')).entries, ['张三']);
 });

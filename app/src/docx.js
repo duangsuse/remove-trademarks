@@ -1,7 +1,11 @@
-// Word <-> Markdown 1:1 投影；差异以修订（w:del / w:ins）写回
-// 用法：const d = await DocxProjection.load(buf); d.md / d.anchor(i)；d.replace(spans) 或 d.applyText(newMd)；d.dropImages / d.wipe；await d.save()
+// Word <-> Markdown 1:1 投影；差异以修订（w:del / w:ins）写回。三层：docx ⇄ md（本文件）⇄ txt（plain.js）
+// 用法：const d = await DocxProjection.load(buf, opts); d.md / d.text / d.anchor(i)；
+//       d.replace(spans) / d.applyText(newMd) / d.editText(fn, { range })；d.dropImages / d.wipe；await d.save()
+// 不依赖脱敏逻辑；结构标记、修订作者的默认值来自 markup.js，可经 opts 覆盖
 import JSZip from 'jszip';
 import { diffLines, diffChars } from 'diff';
+import { PROJECTION } from './markup.js';
+import { plainView, plainEdits } from './plain.js';
 
 const NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const XMLNS = 'http://www.w3.org/XML/1998/namespace';
@@ -14,7 +18,6 @@ const PIC_NS = 'http://schemas.openxmlformats.org/drawingml/2006/picture';
 const C_NS = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
 const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram';
 const V_NS = 'urn:schemas-microsoft-com:vml';
-const M_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math';
 const isW = (n, name) => n.nodeType === 1 && n.namespaceURI === NS && n.localName === name;
 const kids = (n, name) => (n ? [...n.childNodes].filter((c) => isW(c, name)) : []);
 const kid = (n, name) => (n ? [...n.childNodes].find((c) => isW(c, name)) : undefined);
@@ -31,10 +34,6 @@ function own(root, ns, name) {
   return null;
 }
 
-// Markdown 里的结构标记（detect.js 据此识别特殊表格 / 其他文本区）
-export const MARK = { special: ':::特殊表格', end: ':::', others: '---\n\n## 其他文本' };
-// 本工具写入的审阅修订的作者；重新载入时据此先「拒绝」掉
-export const TOOL_AUTHOR = '脱敏助手';
 
 // ---------- 样式 / 编号 ----------
 // 返回 look(styleId, f)：沿 basedOn 链找第一个 f(style) 不为空的值
@@ -130,7 +129,7 @@ function runFmt(r, style) {
 
 // ---------- Markdown 构建 ----------
 class MD {
-  constructor() { this.out = []; this.pid = []; this.off = []; this.ed = []; }
+  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; }
   push(str, pid, off, ed) { for (let i = 0; i < str.length; i++) { this.out.push(str[i]); this.pid.push(pid); this.off.push(off); this.ed.push(ed); } }
   s(str) { this.push(str, -1, 0, 0); }
   sp(str, para, off) { this.push(str, para.idx, off, 0); }
@@ -139,12 +138,11 @@ class MD {
 }
 const marker = (f) => (f === 'bi' ? '***' : f === 'b' ? '**' : '*');
 const ESC = new Set(['*', '\\', '|']);
-const AMBIG = /^(?:#|\||:::|---|- )/; // 行首会被误认成标题 / 表格 / 分隔线 / 列表的正文，前面加 \
-const head3 = (atoms) => atoms.slice(0, 3).map((a) => a.ch).join('');
+const head = (atoms) => atoms.slice(0, 16).map((a) => a.ch).join(''); // 行首够长，能和 marks.ambig 里最长的标记比较
 
 // 文本单元（链接地址、图片说明、图表文字…）：逐字可编辑
 function emitUnit(md, u, lineStart = false) {
-  if (lineStart && AMBIG.test(head3(u.atoms))) md.push('\\', u.idx, 0, 0);
+  if (lineStart && md.ambig.test(head(u.atoms))) md.push('\\', u.idx, 0, 0);
   u.atoms.forEach((a, i) => { if (ESC.has(a.ch)) md.push('\\', u.idx, i, 0); md.push(a.ch, u.idx, i, 1); });
 }
 
@@ -159,7 +157,7 @@ function emitObj(md, para, i, o) {
 function emitPara(md, para, prefix = '', lineStart = false) {
   const { atoms } = para;
   md.s(prefix);
-  if (lineStart && !prefix && !atoms[0].link && AMBIG.test(head3(atoms))) md.sp('\\', para, 0);
+  if (lineStart && !prefix && !atoms[0].link && md.ambig.test(head(atoms))) md.sp('\\', para, 0);
   // 空白 / 制表 / 换行不单独成粗斜体段：沿用前一个（开头则取后一个）非空白的格式
   const eff = atoms.map((a) => (/^\s$/.test(a.ch) ? null : a.fmt));
   let carry = eff.find((f) => f !== null) ?? '';
@@ -221,11 +219,10 @@ function plainTable(tbl) {
 
 // 本工具上一次写入的修订先「拒绝」掉再投影：删除线里的原文还原成正常文字，插入的内容去掉。
 // 否则 Ctrl+Enter 写入审阅修订后，重新载入 A 时原文已经藏在 w:del 里，投影看不到旧内容、黑名单就扫不出来了；
-// 同时重复写入审阅不会叠加。别的作者的修订保持原样。旧版作者名 ss 只认本工具用过的 id 段（>= 900000）。返回处理的数量。
-const ours = (x) => { const a = x.getAttributeNS(NS, 'author'); return a === TOOL_AUTHOR || (a === 'ss' && +x.getAttributeNS(NS, 'id') >= 900000); };
-function rejectOurs(doc) {
+// 同时重复写入审阅不会叠加。isOurs(author, id) 判定哪些是自己的，别的作者的修订保持原样。返回处理的数量。
+function rejectOurs(doc, isOurs) {
   let n = 0;
-  const byTag = (t) => [...doc.getElementsByTagNameNS(NS, t)].filter(ours);
+  const byTag = (t) => [...doc.getElementsByTagNameNS(NS, t)].filter((x) => isOurs(x.getAttributeNS(NS, 'author'), x.getAttributeNS(NS, 'id')));
   for (const x of byTag('ins')) { if (x.parentNode && x.parentNode.localName !== 'rPr') { x.remove(); n++; } }
   for (const x of byTag('del')) {
     if (!x.parentNode || x.parentNode.localName === 'rPr') continue;
@@ -249,6 +246,10 @@ const baseName = (path) => path.split('/').pop().replace(/\.xml$/, '');
 const TEXT_PARTS = { header: '页眉', footer: '页脚', footnotes: '脚注', endnotes: '尾注' };
 const HYPER = /^(\s*HYPERLINK\s+")([^"]+)(")/i;
 const INLINE_WRAP = new Set(['smartTag', 'sdt', 'sdtContent', 'dir', 'bdo', 'customXml']);
+// 投影不了的元素：不写投影，只按标签名列进 unhandled 清单。删除的修订 / 域代码 / 文本框（另行处理）里的文字不算
+const NO_TEXT = new Set(['del', 'moveFrom', 'delText', 'delInstrText', 'instrText', 'txbxContent', 'rPr', 'pPr']);
+const hasText = (el) => [...el.childNodes].some((c) => (c.nodeType === 3 ? c.data.trim() : c.nodeType === 1 && !NO_TEXT.has(c.localName) && hasText(c)));
+const UNHANDLED_NOTE = { oMath: '公式', oMathPara: '公式', ruby: '注音', altChunk: '嵌入的外部文档', object: 'OLE 对象' };
 
 // ---------- 编辑记录 ----------
 class Edits extends Map {
@@ -258,8 +259,15 @@ class Edits extends Map {
 }
 const unmark = (s) => s.replace(/\\([\s\S])|\*+/g, (m, c) => c ?? '').replace(/<br>/g, '\n');
 
+// md 位置 p 处插入：挂到前一个字之后，否则挂到后一个字之前；结构位置（不属于任何单元）返回 null
+function insertAnchor(map, p) {
+  if (p > 0 && map.pid[p - 1] >= 0) return [map.pid[p - 1], map.off[p - 1] + map.ed[p - 1]];
+  if (p < map.pid.length && map.pid[p] >= 0) return [map.pid[p], map.off[p]];
+  return null;
+}
+
 // diff -> 每段编辑。newMap：新文本也是某个 docx 的投影时传入——插入文字只取其中「可编辑字符」，转义反斜杠 / 粗斜体标记 / 表格竖线 / 换行等结构字符不会混进来
-export function computeEdits(origMd, newMd, map, newMap = null, edits = new Edits()) {
+function computeEdits(origMd, newMd, map, newMap, edits) {
   const stats = { del: 0, ins: 0, skipped: 0 };
   const del = (a, b) => {
     let any = false;
@@ -270,14 +278,12 @@ export function computeEdits(origMd, newMd, map, newMap = null, edits = new Edit
     if (newMap) { let t = ''; for (let i = 0; i < text.length; i++) if (newMap.ed[np + i]) t += text[i]; text = t; }
     else text = (raw ? unmark(text) : text).replace(/\r\n?/g, '\n');
     if (!text) return;
-    let pid = -1, at = 0;
-    if (p > 0 && map.pid[p - 1] >= 0) { pid = map.pid[p - 1]; at = map.off[p - 1] + map.ed[p - 1]; }
-    else if (p < map.pid.length && map.pid[p] >= 0) { pid = map.pid[p]; at = map.off[p]; }
-    if (pid < 0) { stats.skipped++; return; }
-    edits.ins(pid, at, text);
+    const a = insertAnchor(map, p);
+    if (!a) { stats.skipped++; return; }
+    edits.ins(a[0], a[1], text);
     stats.ins++;
   };
-  if (origMd === newMd) return { byPara: edits, stats };
+  if (origMd === newMd) return { stats };
   const walkChars = (a, b, pos, np) => {
     if (!b) { del(pos, pos + a.length); return; }
     if (!a) { ins(pos, b, np); return; }
@@ -306,7 +312,7 @@ export function computeEdits(origMd, newMd, map, newMap = null, edits = new Edit
     } else if (p.added) { ins(pos, p.value, np); np += p.value.length; }
     else { pos += p.value.length; np += p.value.length; }
   }
-  return { byPara: edits, stats };
+  return { stats };
 }
 
 // ---------- 写入修订 ----------
@@ -447,6 +453,7 @@ function maxId(parts) {
 
 // ---------- 投影 ----------
 export class DocxProjection {
+  opts = null; // { marks, author, isOurs }
   zip = null;
   parts = new Map(); // path -> {path, doc, dirty}（含 .rels）
   textParts = []; // 正文 + 页眉页脚脚注尾注
@@ -454,6 +461,7 @@ export class DocxProjection {
   md = '';
   map = null; // md 每个字符 -> {pid 单元, off 单元内位置, ed 可编辑}
   warnings = [];
+  unhandled = []; // 投影不了的元素 [{tag: 'm:oMath', count}]，也会汇总进 warnings
   stats = { del: 0, ins: 0, skipped: 0 };
   #edits = new Edits();
   #mirrors = [];
@@ -461,11 +469,17 @@ export class DocxProjection {
   #wipe = false;
   #saved = false;
 
-  static async load(buffer) {
+  // opts（默认见 markup.js PROJECTION）：marks 结构标记（makeMarks）；author save({track}) 的修订作者；
+  // isOurs(author, id) 载入时先拒绝掉的修订
+  static async load(buffer, opts = {}) {
     const d = new DocxProjection();
+    d.opts = { ...PROJECTION, ...opts };
     await d.#load(buffer);
     return d;
   }
+
+  // md -> txt 投影（去掉转义与粗斜体标记），editText 的 fn 拿到的就是它（或其中一段）
+  get text() { return plainView(this.md).text; }
 
   // md 第 i 个字符对应的位置；结构字符（Markdown 标记、表格竖线等）editable 为 false
   anchor(i) {
@@ -475,10 +489,15 @@ export class DocxProjection {
     return { unit, atom: unit.atoms[this.map.off[i]] ?? null, editable: this.map.ed[i] === 1 };
   }
 
-  // 按 md 区间替换：区间内可编辑字符全删，text 插在第一个可编辑字符处（用被删字的格式）
+  // 按 md 区间替换：区间内可编辑字符全删，text 插在第一个可编辑字符处（用被删字的格式）；s === e 为纯插入
   replace(spans) {
     const { pid, off, ed } = this.map, st = { del: 0, ins: 0, skipped: 0 };
     for (const { s, e, text = '' } of spans) {
+      if (s === e) {
+        const a = text && insertAnchor(this.map, s);
+        if (a) { this.#edits.ins(a[0], a[1], text); st.ins++; } else if (text) st.skipped++;
+        continue;
+      }
       let first = -1;
       for (let i = s; i < e; i++) if (ed[i]) { if (first < 0) first = i; this.#edits.del(pid[i], off[i]); }
       if (first < 0) { st.skipped++; continue; }
@@ -488,16 +507,22 @@ export class DocxProjection {
     return this.#count(st);
   }
 
-  // 与新文本做 diff；from：新文本来自另一个 DocxProjection 时传入，结构字符不会写进正文
+  // 与新 md 做 diff；from：新文本来自另一个 DocxProjection 时传入，结构字符不会写进正文
   applyText(newMd, { from = null } = {}) {
     return this.#count(computeEdits(this.md, newMd, this.map, from?.map, this.#edits).stats);
+  }
+
+  // 用函数改纯文本投影：fn(text) -> 新 text，差异写回。range=[s, e]（md 坐标，如 lineRange(d.md, 11, 22)）时 fn 只拿到这一段。
+  // 坐标都基于载入时的投影：多次调用是在原文上叠加，不会看到前一次的结果
+  editText(fn, { range } = {}) {
+    return this.replace(plainEdits(this.md, fn, range));
   }
 
   dropImages(paths) { this.#drop.push(...paths); return this; }
   wipe() { this.#wipe = true; return this; }
 
   // track：写成审阅修订（作者 author）；type 同 JSZip.generateAsync。DOM 会被改写，只能调用一次
-  async save({ track = false, author = TOOL_AUTHOR, type = 'blob' } = {}) {
+  async save({ track = false, author = this.opts.author, type = 'blob' } = {}) {
     if (this.#saved) throw new Error('DocxProjection.save() 只能调用一次');
     this.#saved = true;
     const warnings = [...this.warnings], stats = { ...this.stats };
@@ -550,7 +575,7 @@ export class DocxProjection {
 
   async #load(buffer) {
     const zip = (this.zip = await JSZip.loadAsync(buffer));
-    const { parts, warnings, units } = this;
+    const { parts, warnings, units } = this, { marks, isOurs } = this.opts;
     const load = async (path) => {
       if (!path) return null;
       if (!parts.has(path)) { const doc = await loadXml(zip, path, warnings); parts.set(path, doc ? { path, doc, dirty: false } : null); }
@@ -577,10 +602,12 @@ export class DocxProjection {
     const others = [];
     for (const t in TEXT_PARTS) for (const p of ofType(t)) { const part = await load(p); if (part) others.push({ type: t, part }); }
     this.textParts = [main, ...others.map((o) => o.part)].filter(Boolean);
-    for (const part of this.textParts) { await rels(part.path); if (rejectOurs(part.doc)) part.dirty = true; }
+    for (const part of this.textParts) { await rels(part.path); if (rejectOurs(part.doc, isOurs)) part.dirty = true; }
 
     const unit = (u) => { u.idx = units.length; units.push(u); return u; };
     const textUnit = (part, text, set, extra) => unit({ kind: 'text', part, atoms: [...text].map((ch) => ({ ch, edit: true })), set, ...extra });
+    const unhandled = new Map(); // 标签名 -> 次数
+    const stray = (el) => { if (!NO_TEXT.has(el.localName) && (el.localName === 'altChunk' || hasText(el))) unhandled.set(el.nodeName, (unhandled.get(el.nodeName) || 0) + 1); };
     const found = []; // 正文里发现的文本框 / 图表 / SmartArt，放到「其他文本」区
     const linkUnits = new Map();
     const relLink = (h, part) => {
@@ -630,7 +657,7 @@ export class DocxProjection {
             obj(ch && [...ch.childNodes].find((x) => isW(x, 'drawing')));
             continue;
           }
-          if (c.namespaceURI !== NS) continue;
+          if (c.namespaceURI !== NS) { stray(c); continue; }
           switch (c.localName) {
             case 't': for (const ch of c.textContent) atoms.push({ ...base, ch, edit: !locked }); break;
             case 'tab': atoms.push({ ...base, ch: '\t', edit: false }); break;
@@ -648,12 +675,14 @@ export class DocxProjection {
               }
               break;
             }
+            default: stray(c);
           }
         }
       };
       const walk = (n, locked) => {
         for (const c of n.childNodes) {
-          if (c.nodeType !== 1 || c.namespaceURI !== NS) continue;
+          if (c.nodeType !== 1) continue;
+          if (c.namespaceURI !== NS) { stray(c); continue; }
           const ln = c.localName;
           if (ln === 'r') addRun(c, locked);
           else if (ln === 'ins' || ln === 'moveTo') walk(c, true);
@@ -663,13 +692,14 @@ export class DocxProjection {
             walk(c, locked);
             link = prev;
           } else if (INLINE_WRAP.has(ln)) walk(c, locked);
+          else stray(c);
         }
       };
       walk(p, false);
       return atoms;
     };
 
-    const md = new MD();
+    const md = new MD(marks.ambig);
     const mkPara = (p, part) => { const atoms = collect(p, part); return atoms.length ? unit({ kind: 'para', el: p, part, atoms }) : null; };
     const listPrefix = (lab, indent) => (lab ? (indent ? '  '.repeat(lab.ilvl) : '') + lab.text + ' ' : '');
     const scanTextboxes = (p, part) => {
@@ -680,10 +710,10 @@ export class DocxProjection {
         if (outer) found.push({ title: '文本框', container: tb, part });
       }
     };
-    let altChunk = 0;
     const walkBlocks = (container, part) => {
       for (const c of container.childNodes) {
-        if (c.nodeType !== 1 || c.namespaceURI !== NS) continue;
+        if (c.nodeType !== 1) continue;
+        if (c.namespaceURI !== NS) { stray(c); continue; }
         if (c.localName === 'p') {
           scanTextboxes(c, part);
           const lab = lists.label(c); // 空段落也要计数
@@ -696,7 +726,6 @@ export class DocxProjection {
           const sc = kid(c, 'sdtContent');
           if (sc) walkBlocks(sc, part);
         } else if (c.localName === 'customXml') walkBlocks(c, part);
-        else if (c.localName === 'altChunk') altChunk++;
         else if (c.localName === 'tbl') {
           const grid = plainTable(c);
           if (grid) {
@@ -714,7 +743,7 @@ export class DocxProjection {
             md.s('\n');
           } else {
             const start = md.length;
-            md.s(MARK.special + '（1格1行）\n');
+            md.s(marks.specialBegin);
             const inner = [];
             for (const tr of kids(c, 'tr')) for (const tc of tr.childNodes) {
               if (isW(tc, 'tc')) inner.push(tc);
@@ -723,15 +752,16 @@ export class DocxProjection {
             const before = md.length;
             for (const tc of inner) walkCell(tc, part);
             if (md.length === before) md.cut(start);
-            else md.s(MARK.end + '\n\n');
+            else md.s(marks.specialEnd);
           }
-        }
+        } else stray(c);
       }
     };
     // 特殊表格单元格：每段一行，嵌套表格就地展平
     const walkCell = (tc, part) => {
       for (const c of tc.childNodes) {
-        if (c.nodeType !== 1 || c.namespaceURI !== NS) continue;
+        if (c.nodeType !== 1) continue;
+        if (c.namespaceURI !== NS) { stray(c); continue; }
         if (c.localName === 'p') {
           scanTextboxes(c, part);
           const lab = lists.label(c), para = mkPara(c, part);
@@ -739,6 +769,7 @@ export class DocxProjection {
         } else if (c.localName === 'tbl') {
           for (const tr of kids(c, 'tr')) for (const t2 of kids(tr, 'tc')) walkCell(t2, part);
         } else if (c.localName === 'sdt' || c.localName === 'customXml') { const sc = c.localName === 'sdt' ? kid(c, 'sdtContent') : c; if (sc) walkCell(sc, part); }
+        else stray(c);
       }
     };
 
@@ -777,8 +808,8 @@ export class DocxProjection {
       const sec = await sectionOf(queue[i]);
       if (sec) {
         const start = md.length;
-        if (first) md.s(MARK.others + '（页眉页脚 / 脚注 / 文本框 / 图表）\n\n');
-        md.s('### ' + sec.title + '\n\n');
+        if (first) md.s(marks.othersHead);
+        md.s(marks.sectionHead(sec.title));
         const h = md.length;
         if (sec.container) walkBlocks(sec.container, sec.part);
         else if (sec.units.length) { for (const u of sec.units) { emitUnit(md, u, true); md.s('\n'); } md.s('\n'); }
@@ -789,11 +820,10 @@ export class DocxProjection {
     for (const m of relsOf.values()) for (const r of m.values()) if (r.type === 'diagramDrawing' && !r.external) { const p = await load(r.path); if (p && !this.#mirrors.includes(p)) this.#mirrors.push(p); }
 
     // 投影不到的内容：列出来提醒
-    if (altChunk) warnings.push(`正文里有 ${altChunk} 处嵌入的外部文档（altChunk），其中文字没有处理`);
+    this.unhandled = [...unhandled].map(([tag, count]) => ({ tag, count }));
+    if (unhandled.size) warnings.push('以下元素没有投影，其中的文字没有处理：\n' + this.unhandled.map(({ tag, count }) => `    <${tag}> ×${count}` + (UNHANDLED_NOTE[tag.split(':').pop()] ? `（${UNHANDLED_NOTE[tag.split(':').pop()]}）` : '')).join('\n'));
     const emb = Object.keys(zip.files).filter((p) => /^word\/embeddings\/[^/]+$/.test(p));
     if (emb.length) warnings.push(`有 ${emb.length} 个内嵌对象（Excel / Visio / 图表数据等，word/embeddings/），里面的内容原样保留`);
-    const math = main ? main.doc.getElementsByTagNameNS(M_NS, 'oMath').length : 0;
-    if (math) warnings.push(`有 ${math} 处公式，公式里的文字没有投影`);
     const vec = Object.keys(zip.files).filter((p) => /^word\/media\/[^/]+\.(?:svg|emf|wmf|tiff?)$/i.test(p));
     if (vec.length) warnings.push(`有 ${vec.length} 张 svg / emf 等格式的图片不能替换成占位图（svg 常与同名 png 成对，只换 png 时 Word 仍显示 svg）`);
 

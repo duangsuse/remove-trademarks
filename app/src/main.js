@@ -1,6 +1,9 @@
 import './style.css';
 import { DocxProjection, listImages } from './docx.js';
-import { scan, parseRules, parseCustom, parseBlackLines, replacement, selection, chapters, plainOf, unmark, nerLines, spliceMd } from './detect.js';
+import { scan, replacement, selection, chapters, nerLines } from './detect.js';
+import { plainOf, unmark, spliceMd, lineRange } from './plain.js';
+import { partnerOf } from './markup.js';
+import { BlackBox, lineRule, parseRules, parseCustom } from './boxes.js';
 import { MAIN, EXTRA, TOOLS, TYPE_NAME, DEFAULT_REPLACE_RULES, HIDE_WHEN_OFF, TAG_CATS, ENT_CATS, TITLE_RE, ABBR_MAX, RULES, FINGERPRINT_URL, ABBR_RE, NAME_LABELS, NAME_VALUE } from './rules.js';
 import * as ner from './ner.js';
 import * as fs from './fs.js';
@@ -57,7 +60,8 @@ const SPECIAL_CODE = {
   ner_person: '离线 NER：PERSON', ner_place: '离线 NER：GPE / LOC', ner_cand: '离线 NER：ORG / FAC / PRODUCT / NORP（> 3 字）',
   ner_verify: '公司／地址正则命中处，若没有任何 NER 的 ORG / FAC / GPE / LOC 实体与之重叠 → 标为存疑（红，默认不选）',
   ner_alias: '对 NER 识别出的人名（姓 X）额外标出 X总 / X工 / X老师 / X经理… / 小X / 老X',
-  ner_num: '离线 NER：DATE / MONEY / PERCENT（含数字，正则已覆盖的不再列）',
+  ner_date: '离线 NER：DATE（含数字，正则已覆盖的不再列）；PERCENT 随「日期和百分比」开关生效',
+  ner_money: '离线 NER：MONEY（含数字，正则已覆盖的不再列）',
 };
 function ruleCode(id) { // 悬停预览：该开关背后的规则代码
   const lines = Object.entries(RULES).filter(([, r]) => r.en === id).map(([k, r]) => `${k}: ${r.re}`);
@@ -107,34 +111,30 @@ document.addEventListener('change', (e) => {
 });
 
 // ---------- 黑名单框：=== 以上手填，以下随右侧面板同步 ----------
-const SEP = '===', blackEl = $('black');
+const blackEl = $('black');
 let lastGen = new Set();
-const base = (it) => !(it.cat === 'ner' && it.grp === 'cand' && it.en !== 'ner_num') && !it.weak; // 机构/产品候选（>3 字）默认不选
+const base = (it) => !(it.cat === 'ner' && it.grp === 'cand') && !it.weak; // 机构/产品候选（>3 字）默认不选
 const memo = new Map(); // key -> {text,en,base}：见过的条目；文中不再出现（比如已脱敏）也保留，黑名单框不随文本变化
 const memoOn = (key, m) => (key in state.on ? state.on[key] : !!state.cats[m.en] && m.base);
 function remember() {
   for (const it of items.values()) if (it.cat !== 'black') memo.set(it.key, { text: it.text, en: it.en, base: base(it), ner: it.cat === 'ner' });
 }
-const splitBlack = () => {
-  const lines = blackEl.value.split('\n'), i = lines.findIndex((l) => l.trim() === SEP);
-  return { head: i < 0 ? lines : lines.slice(0, i), tail: i < 0 ? [] : lines.slice(i + 1) };
-};
-const words = (ls) => ls.map((l) => l.trim()).filter(Boolean);
-blackEl.value = '\n' + SEP;
+const black = () => BlackBox.load(blackEl.value);
+blackEl.value = BlackBox.dump({ own: [''] });
 function readHead() {
-  const { words: w, ranges } = parseBlackLines(splitBlack().head);
-  state.blacklist = w; state.ranges = ranges;
+  const { words, ranges } = black();
+  state.blacklist = words; state.ranges = ranges;
 }
 function syncBlack() {
-  const { head } = splitBlack();
-  const own = new Set(words(head)), gen = [], seen = new Set();
+  const { own: head, entries } = black();
+  const own = new Set(entries), gen = [], seen = new Set();
   for (const [key, m] of memo) {
     if (!memoOn(key, m) || own.has(m.text) || seen.has(m.text)) continue;
     seen.add(m.text); gen.push(m.text);
   }
   lastGen = seen;
   const headText = head.join('\n');
-  const next = headText + '\n' + SEP + (gen.length ? '\n' + gen.slice(0, 800).join('\n') : '');
+  const next = BlackBox.dump({ own: head, synced: gen.slice(0, 800) });
   if (next === blackEl.value) return;
   if (document.activeElement === blackEl && blackEl.selectionStart > headText.length) return; // 正在编辑 === 以下，失焦后再同步
   const [a, b, t] = [blackEl.selectionStart, blackEl.selectionEnd, blackEl.scrollTop];
@@ -144,8 +144,8 @@ function syncBlack() {
 }
 blackEl.oninput = () => refresh();
 blackEl.onchange = () => { // 编辑了 === 以下：删行=取消选中，新增行=选中同名项，无同名项则并入黑名单
-  const { head, tail } = splitBlack();
-  const want = new Set(words(tail)), own = new Set(words(head));
+  const { entries, synced } = black();
+  const want = new Set(synced), own = new Set(entries);
   const known = new Set();
   for (const [key, m] of memo) {
     known.add(m.text);
@@ -153,23 +153,15 @@ blackEl.onchange = () => { // 编辑了 === 以下：删行=取消选中，新�
     else if (!lastGen.has(m.text) && want.has(m.text)) state.on[key] = true;
   }
   const add = [...want].filter((w) => !lastGen.has(w) && !own.has(w) && !known.has(w));
-  if (add.length) blackEl.value = [...words(head), ...add].join('\n') + '\n' + SEP;
+  if (add.length) blackEl.value = BlackBox.dump({ own: [...entries, ...add] });
   run();
 };
 $('custom').oninput = () => { state.custom = parseCustom($('custom').value); refresh(); };
 $('rules').oninput = () => refresh();
 
 // 对黑名单框的结构化修改（右侧面板 / 正文删除 / 章节删除 都走这里）
-const sameLine = (a, b) => a === b || (() => { const x = parseBlackLines([a]), y = parseBlackLines([b]); return x.ranges.length && JSON.stringify(x.ranges) === JSON.stringify(y.ranges); })();
-function boxAdd(text) {
-  const { head } = splitBlack();
-  if (words(head).some((l) => sameLine(l, text))) return;
-  blackEl.value = [...words(head), text].join('\n') + '\n' + SEP;
-}
-function boxRemove(text) {
-  const { head } = splitBlack();
-  blackEl.value = words(head).filter((l) => !sameLine(l, text)).join('\n') + '\n' + SEP;
-}
+const boxAdd = (text) => { blackEl.value = BlackBox.add(blackEl.value, text); };
+const boxRemove = (text) => { blackEl.value = BlackBox.remove(blackEl.value, text); };
 function setOn(it, on) {
   if (it.cat === 'black') { if (!on) boxRemove(it.text); } else state.on[it.key] = on;
 }
@@ -177,7 +169,7 @@ function setOn(it, on) {
 // ---------- 撤销 / 重做：只管黑名单 + 删除时替换规则 ----------
 const undoS = [], redoS = [];
 let lastPush = 0;
-const snap = () => ({ head: splitBlack().head.join('\n'), on: { ...state.on }, rules: $('rules').value });
+const snap = () => ({ own: black().own, on: { ...state.on }, rules: $('rules').value });
 function checkpoint(force) {
   const now = Date.now();
   if (!force && now - lastPush < 800) { lastPush = now; return; } // 连续输入合并为一步
@@ -185,7 +177,7 @@ function checkpoint(force) {
   redoS.length = 0; lastPush = now;
 }
 function restore(sn) {
-  blackEl.value = sn.head + '\n' + SEP; state.on = { ...sn.on }; $('rules').value = sn.rules;
+  blackEl.value = BlackBox.dump({ own: sn.own }); state.on = { ...sn.on }; $('rules').value = sn.rules;
   lastPush = 0; run();
 }
 function undo() { if (!undoS.length) return status('没有可撤回的操作（只记录黑名单与替换规则）'); redoS.push(snap()); restore(undoS.pop()); status('已撤回'); }
@@ -328,11 +320,23 @@ const locT = { kind: '', id: '' };
 const isT = (kind, id) => locT.kind === kind && locT.id === id;
 const locLabel = (it) => { if (!isT('item', it.key)) return `${it.occ.length} ↓`; const n = remainOf(it.occ); return n ? `剩${n} ↓` : '回首 ↥'; };
 const locBtn = (it) => (it.occ.length ? `<button class="loc" data-loc="${esc(it.key)}" title="定位到下一个出现（到头后回第一处）">${locLabel(it)}</button>` : '<button class="loc" disabled>—</button>');
+// 把 md 位置 off 滚到视口高度的 at 处（默认 1/3）
+function scrollToOff(off, smooth, at = 1 / 3) {
+  const top = rangeOf(off, Math.min(off + 1, ta.value.length)).getBoundingClientRect().top - ta.getBoundingClientRect().top + ta.scrollTop;
+  ta.scrollTo({ top: Math.max(0, top - ta.clientHeight * at), behavior: smooth ? 'smooth' : 'auto' });
+}
 function gotoOcc(s, e, smooth) {
   ta.focus(); ta.setSelectionRange(s, e);
-  const top = rangeOf(s, Math.max(e, s + 1)).getBoundingClientRect().top - ta.getBoundingClientRect().top + ta.scrollTop;
-  ta.scrollTo({ top: Math.max(0, top - ta.clientHeight / 3), behavior: smooth ? 'smooth' : 'auto' });
+  scrollToOff(s, smooth);
 }
+// 特殊表格：选中（或点在）开头行上，平滑滚到收尾行（放在视口下方，表格内容在上面）；在收尾行上则滚回开头
+function jumpPair() {
+  syncSel();
+  const s = ta.selectionStart, to = partnerOf(ta.value, s, ta.selectionEnd);
+  if (to >= 0) scrollToOff(to, true, to > s ? 2 / 3 : 1 / 3);
+}
+ta.addEventListener('mouseup', jumpPair);
+ta.addEventListener('keyup', (e) => { if (e.key.startsWith('Arrow') || e.key === 'Home' || e.key === 'End') jumpPair(); });
 let lastTarget = '';
 function locate(occ) { // 平滑滚动只在切换查找目标时用；同一目标连着点则直接跳
   const sig = locT.kind + locT.id, smooth = sig !== lastTarget;
@@ -411,7 +415,7 @@ function rulesFromSelection(s, e) {
   const word = (h) => unmark(h.ln.slice(h.os, h.oe)).trim(); // 黑名单存纯文字，不带 ** 等标记
   if (hits.length === 1) { const t = word(hits[0]); return t ? [t] : []; }
   for (const h of hits) { if (h.whole) full.push(h.i + 1); else { const t = word(h); if (t) out.push(t); } }
-  for (let k = 0; k < full.length;) { let j = k; while (full[j + 1] === full[j] + 1) j++; out.unshift(j > k ? `#L${full[k]}~L${full[j]}` : `#L${full[k]}`); k = j + 1; }
+  for (let k = 0; k < full.length;) { let j = k; while (full[j + 1] === full[j] + 1) j++; out.unshift(lineRule.dump(full[k], full[j])); k = j + 1; }
   return out;
 }
 function addFromSelection() {
@@ -472,7 +476,7 @@ $('chapters').addEventListener('contextmenu', (e) => {
   e.preventDefault();
   const c = chs[el.dataset.i]; if (!c) return;
   const lineNo = (pos) => ta.value.slice(0, pos).split('\n').length;
-  const rule = `#L${lineNo(c.s)}~L${lineNo(Math.max(c.s, c.e - 1))}`;
+  const rule = lineRule.dump(lineNo(c.s), lineNo(Math.max(c.s, c.e - 1)));
   edit(() => boxAdd(rule));
   status(`章节「${c.title.slice(0, 16)}」已加入黑名单 ${rule}（Ctrl+Z 撤回）`);
 });
@@ -620,7 +624,7 @@ async function openDoc(i) {
   doc.images = await listImages(p.zip);
   resetKeep();
   ta.value = p.md; ta.setSelectionRange(0, 0); ta.scrollTop = 0; state.ner = []; state.on = {}; memo.clear(); 
-  doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0; blackEl.value = [...words(splitBlack().head).filter((l) => !parseBlackLines([l]).ranges.length), ''].join('\n') + SEP; // 保留黑名单词，行号规则属于旧文档故丢弃
+  doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0; blackEl.value = BlackBox.dump({ own: black().words }); // 保留黑名单词，行号规则属于旧文档故丢弃
   $('title').textContent = ent.name.replace(/\.docx$/i, '');
   setFileInfo(ent.name, file.size);
   run(); status('已载入 · Ctrl S → _脱敏.docx · Ctrl ⏎ 审阅面板 → A');
@@ -809,5 +813,5 @@ function scanPanels() {
   updateCounts(); renderPanels();
 }
 
-window.__di = { ruleNth, rules: rulesApi, openDoc, state, ta, run, ner, DocxProjection, doc, boxAdd, edit, undo, redo, finalMd, redactions, applyAll, reviewToA, get items() { return items; }, get sel() { return sel; } };
+window.__di = { ruleNth, rules: rulesApi, openDoc, state, ta, run, ner, fs, DocxProjection, lineRange, doc, boxAdd, edit, undo, redo, finalMd, redactions, applyAll, reviewToA, get items() { return items; }, get sel() { return sel; } };
 run();

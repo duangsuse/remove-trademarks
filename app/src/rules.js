@@ -79,9 +79,9 @@ export const EXTRA = [
   { id: 'ssn', name: '美国社会安全码 (SSN)' }, { id: 'card', name: '信用卡号' }, { id: 'iban', name: 'IBAN 国际银行账号' },
   { id: 'ip4', name: 'IPv4 地址' }, { id: 'ip6', name: 'IPv6 地址' }, { id: 'url', name: '网址' }, { id: 'birth', name: '出生日期' },
   { id: 'ner_cand', name: '机构 / 产品（模型备选）' },
-  { id: 'ner_verify', name: 'NER 校验公司／地址正则', nn: true }, { id: 'ner_alias', name: 'NER 人名放大（张总 / 小张）', nn: true },
-  { id: 'ner_num', name: 'NER 日期 / 金额 / 百分比补漏', nn: true },
-].map((x) => ({ ...x, def: false }));
+  { id: 'ner_verify', name: 'NER 窄化公司地址', nn: true }, { id: 'ner_alias', name: 'NER 人名放大（张总 / 小张）', nn: true },
+  { id: 'ner_date', name: 'NER 日期补漏', nn: true, def: true }, { id: 'ner_money', name: 'NER 金额补漏', nn: true },
+].map((x) => ({ def: false, ...x }));
 
 // 脱敏工具（勾选项与 di-app.png 一致）：scope=tools 为行为开关，scope=cats 为 NER 高亮
 export const TOOLS = [
@@ -92,7 +92,7 @@ export const TOOLS = [
 ];
 
 // 左栏该项关闭时，对应条目在右侧列表里也隐藏（量大 / 属于「高亮」类）；其余规则关闭时仍列出，只是默认不选中，可点击切换
-export const HIDE_WHEN_OFF = new Set(['date', 'ner_person', 'ner_place', 'ner_num']);
+export const HIDE_WHEN_OFF = new Set(['date', 'ner_person', 'ner_place', 'ner_date', 'ner_money']);
 
 // 含姓名的表格：这些标签单元格（或特殊表格中的这些行）的下一格视为姓名
 export const NAME_LABELS = /^(?:姓名|联系人|联系人姓名|负责人|项目负责人|法定代表人|法人代表|法人|填报人|申报人|经办人|代表人|总监|技术总监|填表人)$/;
@@ -114,7 +114,7 @@ export const CHAPTER_FALLBACK = [
 ];
 
 // 替换规则的默认文本
-export const DEFAULT_REPLACE_RULES = '.*公司 => 某公司\n. => *';
+export const DEFAULT_REPLACE_RULES = '.*公司 => 某公司\n::patentTitle:: 一种.* => 某项专利\n::cname:: .* => 某经理\n. => *';
 
 // 姓名值的排除词：标签格右边若是这些字段名，说明不是姓名
 export const NAME_STOP = /^(?:电话|手机|手机号|邮箱|邮件|电子邮箱|电子邮件|联系电话|职务|职称|部门|传真|地址|性别|学历|年龄|备注|姓名|联系人|负责人|无|暂无|略)$/;
