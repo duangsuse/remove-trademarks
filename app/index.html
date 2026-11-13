@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>数据集打码工具</title>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span id="logo" class="logo" title="点击切换深色/浅色">HD</span><h1>数据打码工具</h1><span class="sub">应断网使用 · 用小模型辅助</span></div>
+  <div class="top-r">
+    <button id="modelWarn" class="warnchip" hidden title="点击选择 .onnx 模型文件，或把含模型的文件夹拖进来">⚠️ 离线模型未载入</button>
+    <span id="pill" class="pill" title="">自加载共 0 次删除</span>
+  </div>
+</header>
+<div class="layout">
+  <aside class="left">
+    <h3>一键脱敏级别</h3>
+    <div id="catList" class="checks"></div>
+    <details id="more" class="more">
+      <summary>更多规则 <span id="moreN" class="mono"></span></summary>
+      <div id="extraList" class="checks"></div>
+      <h4>自订规则（每行 名称 :: 正则）</h4>
+      <textarea id="custom" class="mini" rows="3" spellcheck="false" placeholder="工号 :: EMP\d{6}"></textarea>
+    </details>
+
+    <h3>脱敏工具</h3>
+    <div id="toolList" class="checks"></div>
+
+    <h3>删除时（替换）规则</h3>
+    <textarea id="rules" class="mini" rows="2" spellcheck="false"></textarea>
+
+    <h3>黑名单词汇</h3>
+    <textarea id="black" class="mini" rows="6" spellcheck="false" placeholder="每行一个黑名单词；=== 行以下由右侧面板自动同步"></textarea>
+    <p class="hint">"===" 行以下随右侧面板动态同步，删掉某行即取消该项。，Ctrl+Z 只撤回这两个框。</p>
+
+    <h3>图片保留工具</h3>
+    <div id="gallery" class="gallery"></div>
+    <p class="hint" id="galleryHint">DOCX 保存时自动替换为占位小图。需删除盖章和含公司特征的图</p>
+  </aside>
+
+  <main class="center">
+    <h2 id="title">未打开文件</h2>
+    <div class="banner" id="banner">
+      <span id="bannerText">已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。</span>
+      <span id="fileSel" class="filesel mono" tabindex="0" role="button" title="点击选择文件 / 打开文件夹"><i class="tri">▼</i><span id="fileInfo">打开文件夹…</span><div id="fileMenu" class="menu" hidden></div></span>
+    </div>
+    <div class="editor" id="editor">
+      <div id="hl" class="layer" aria-hidden="true"></div>
+      <textarea id="ta" readonly spellcheck="false" placeholder="把文件夹（含 .docx 与 .onnx 小模型）拖到这里，或点右上 ▼ 打开文件夹"></textarea>
+      <div id="chapters" class="chapters" hidden></div>
+    </div>
+  </main>
+
+  <aside class="right">
+    <div class="panels">
+      <section class="panel"><div class="ph"><b>实体清单</b><button id="cnt-man" class="of mono" data-all="ent" title="点击全选 / 全不选"></button></div><div id="entList"></div>
+        <div id="addBox"><button id="addMan" class="add">+ Add</button></div></section>
+      <section class="panel"><div class="ph"><b>人名地名</b><button id="cnt-place" class="of mono" data-all="place" title="点击全选 / 全不选"></button></div><div id="placeList" class="chips"></div></section>
+      <section class="panel"><div class="ph"><b>简称/电话/专利号</b><button id="cnt-tag" class="of mono" data-all="tag" title="点击全选 / 全不选"></button></div><div id="tagList" class="chips"></div></section>
+      <section class="panel cand"><div class="ph"><b>自动识别 (备选)</b><button id="cnt-cand" class="of mono" data-all="cand" title="点击全选 / 全不选"></button></div><div id="candList"></div></section>
+    </div>
+    <footer class="foot">
+      <div class="sum"><span>要打码的选区</span><b id="sum" class="mono">0 of 0</b></div>
+      <button id="apply" class="primary" title="Ctrl+S：应用黑名单 + 替换规则，直接替换文本（无修订），图片 / 指纹一并处理，写到 原名_脱敏.docx">完整应用脱敏方案<small>（到 _脱敏.docx）</small></button>
+      <button id="append" class="primary alt" title="Ctrl+Enter：读取 A 与 A_脱敏 对比，差异作为修订写入 A（审阅面板）；也可当 diff 用">追加到Word的审阅面板<small>（仅供比对）</small></button>
+      <div class="hint mono" id="status">Ctrl S → 脱敏 · Ctrl ⏎ 审阅面板 · 在 <i class="tri">▼</i> 重新下拉选中即可重来</div>
+    </footer>
+  </aside>
+</div>
+<div id="dropMask" class="dropmask">松开以载入文件夹 / 文件</div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
