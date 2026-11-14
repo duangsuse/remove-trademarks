@@ -157,7 +157,7 @@ async function modelId() { // 模型内容哈希，每个模型只算一次（10
   return (hashing ||= sha(await model.arrayBuffer()).then((h) => (modelHash = hex(h, 32)))).finally(() => { hashing = null; });
 }
 const lineKey = async (mh, pre, t) => hex(await sha(`${mh}\0${CACHE_VER}\0${pre}\0${t}`));
-export const cacheExport = () => ({ v: CACHE_VER, model: modelHash, items: [...cache].slice(-20000) });
+export const cacheExport = () => ({ v: CACHE_VER, model: modelHash, items: [...cache].slice(-40000) });
 export function cacheImport(o) { if (o?.v === CACHE_VER && o.model && Array.isArray(o.items)) pending = o; } // 模型哈希对得上才会并入
 
 // ---------------- 识别 ----------------

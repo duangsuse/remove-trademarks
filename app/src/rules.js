@@ -12,6 +12,15 @@ export const TAG_CATS = new Set(['abbr', 'patent', 'patentWord', 'patentTitle', 
 export const ENT_CATS = new Set(['company', 'addr']);
 
 const cn = '\\u4e00-\\u9fa5';
+// IBAN 校验：国家码必须是 IBAN 成员国（CN / ZL 等不是）+ mod-97；防止专利号、编号被误认
+const IBAN_CC = new Set('AD AE AL AT AZ BA BE BG BH BR BY CH CR CY CZ DE DK DO EE EG ES FI FO FR GB GE GI GL GR GT HR HU IE IL IQ IS IT JO KW KZ LB LC LI LT LU LV LY MC MD ME MK MR MT MU NL NO PK PL PS PT QA RO RS SA SC SD SE SI SK SM ST SV TL TN TR UA VA VG XK'.split(' '));
+const ibanOk = (s) => {
+  const t = s.replace(/\s/g, '');
+  if (!IBAN_CC.has(t.slice(0, 2)) || t.length < 15 || t.length > 34) return false;
+  let r = 0;
+  for (const c of t.slice(4) + t.slice(0, 4)) for (const d of String(parseInt(c, 36))) r = (r * 10 + +d) % 97;
+  return r === 1;
+};
 const luhn = (s) => {
   const d = s.replace(/\D/g, '');
   if (d.length < 13 || d.length > 19) return false;
@@ -22,12 +31,18 @@ const luhn = (s) => {
 
 // 公司名左边界：正则没有分词，会把名称前面的动词短语一起吃进来（"全面采用上海…有限公司"、"部署我公司选用华为…有限公司"）。
 // 返回要从左边截掉的字数：截到最后一个「明确的动词」之后；动词不在开头、截完仍 >= 4 字才截（避免伤到 "联合电子" 这类名称）。
-const LEAD_VERB = /(?:选用|采用|采购|购买|选择|委托|聘请|引进|依托|配置|部署|接入|对接|使用|签约|通过)/g; // 不含「联合」：它常是名称的一部分（联合电子），截错会漏掉名称前半
+const LEAD_VERB = /(?:选用|采用|采购|购买|选择|委托|聘请|引进|依托|配置|部署|接入|引入|对接|使用|签约|通过)/g;
+// 单字分词（是 / 由 / 向 …）：只在前面有字时才截，且名称不以它开头；「是德科技」等名称里的「是」不算
+const LEAD_WORD = /(?:是(?!德)|由|以|在|入|向|从|将|于|把|被|用|过|了|配|给|让|(?<!华)为|的)/g; // 不含「联合」：它常是名称的一部分（联合电子），截错会漏掉名称前半
 function companyLead(text) {
   let k = 0;
   for (const m of text.matchAll(LEAD_VERB)) {
     const end = m.index + m[0].length;
     if (m.index >= 1 && text.length - end >= 4) k = end;
+  }
+  for (const m of text.matchAll(LEAD_WORD)) { // 单字分词不要求出现在第 2 字之后：「由上海…」整个「由」也要截
+    const end = m.index + 1;
+    if (text.length - end >= 4 && end > k) k = end;
   }
   return k;
 }
@@ -40,23 +55,26 @@ export const RULES = {
   },
   // ZL专利号选项还包括：「发明专利」「专利号」字样，以及「一种……」开头的专利名称（一种 + 5 个以上非空白字符，以空白结束）
   patentWord: { name: '专利字样', en: 'patent', cls: 'warn', warn: true, re: /发明专利|专利号/g, hint: '发明专利、专利号' },
-  patentTitle: { name: '专利名称', en: 'patent', cls: 'warn', warn: true, re: /一种[^\s|*]{5,}(?=\s)/g, hint: '一种基于…的方法 ' },
-  mobile: { name: '手机号', en: 'contact', cls: 'phone', re: /(?<!\d)1[3-9]\d{9}(?!\d)/g, hint: '18912636641' },
-  landline: { name: '座机', en: 'contact', cls: 'phone', re: /(?<!\d)\(?0\d{2,3}\)?-\d{7,8}(?:-\d{1,6})?(?!\d)/g, hint: '025-83123456' },
+  patentTitle: { name: '专利名称', en: 'patent', cls: 'warn', warn: true, re: /一种[^\s|\]*，等,。；;、：:]{5,}(?=[\s\]，等,。；;、：:]|$)/g, hint: '一种基于…的方法（遇空白或逗号结束）' },
+  mobile: { name: '手机号', en: 'contact', cls: 'phone', re: /(?<!\d)1[3-9]\d{9}(?!\d)|(?<![\d+])(?:\+886[\s-]?|0)9\d{2}[\s-]?\d{3}[\s-]?\d{3}(?!\d)/g, hint: '18912636641、0912-345-678、+886-912-345-678' },
+  landline: { name: '座机', en: 'contact', cls: 'phone', re: /(?<!\d)\(?0\d{2,3}\)?-\d{7,8}(?:-\d{1,6})?(?!\d)|(?<![\d+])(?<!(?:統一編號|統編|统一编号)[：:\s]*)(?!\(?09)(?:(?:\(0\d{1,2}\)|0\d{1,2})[\s-]?|\+886[\s-]?\d{1,2}[\s-])\d{3,4}[\s-]?\d{3,4}(?!\d)/g, hint: '025-83123456、(02)2712-3456、037-123456' },
   email: { name: '电子邮件', en: 'contact', cls: 'mail', re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, hint: 'someone@example.com' },
-  credit: { name: '统一社会信用代码', cls: 'warn', re: /(?<![0-9A-Za-z])[0-9A-HJ-NP-RTUWXY]{2}\d{6}[0-9A-HJ-NP-RTUWXY]{10}(?![0-9A-Za-z])/g, hint: '91320900MA7HAK6C0X' },
-  idcard: { name: '身份证号', cls: 'warn', re: /(?<!\d)[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)/g, hint: '320902199001011234' },
+  credit: { name: '统一社会信用代码', cls: 'warn', re: /(?<![0-9A-Za-z])[0-9A-HJ-NP-RTUWXY]{2}\d{6}[0-9A-HJ-NP-RTUWXY]{10}(?![0-9A-Za-z])|(?<=統一編號[：:\s]*|統編[：:\s]*|统一编号[：:\s]*)\d{8}(?!\d)/g, hint: '91320900MA7HAK6C0X、統一編號 04595257' },
+  idcard: { name: '身份证号', cls: 'warn', re: /(?<!\d)[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)|(?<![A-Za-z0-9])[A-Z][12A-D]\d{8}(?![A-Za-z0-9])/g, hint: '320902199001011234、A123456789' },
   cname: { name: '姓名（标签后）', cls: 'warn', re: new RegExp(`(?<=(?:姓名|联系人|负责人|法定代表人|法人代表|填报人|申报人|项目负责人|经办人|代表人)[：:]\\s?)[${cn}·]{2,4}`, 'g'), hint: '联系人：徐天祥' },
-  company: { name: '公司／组织名称', cls: 'company', re: new RegExp(`(?<=[：:，,。；;、“"（(\\s|*]|^)[${cn}A-Za-z0-9（）()]{2,24}?(?:集团股份有限公司|集团有限公司|股份有限公司|有限责任公司|有限公司|分公司|事务所|研究院|研究所)`, 'gm'), lead: companyLead, hint: '超维微电子（盐城）有限公司' },
-  addr: { name: '地址', cls: 'addr', re: new RegExp(`[${cn}]{2,12}(?:省|市)[${cn}]{1,10}(?:区|县)[${cn}\\d\\-]{1,25}?(?:号|栋|幢|楼|室)`, 'g'), hint: '盐城市盐都区盐渎路999号' },
-  intl: { name: '国际电话', cls: 'phone', re: /(?<![\w+])\+\d{1,3}[\s-]?\(?\d{1,4}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}(?!\d)/g, hint: '+86 138 0013 8000' },
-  ssn: { name: '美国社会安全码 (SSN)', cls: 'warn', re: /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/g, hint: '123-45-6789' },
+  company: { name: '公司／组织名称', cls: 'company', re: new RegExp(`(?<=[：:，,。；;、“"（(\\s|*]|^)[${cn}A-Za-z0-9（）()]{2,24}?(?:集团股份有限公司|集团有限公司|股份有限公司|有限责任公司|有限公司|分公司|事务所|研究院|研究所|診所|事務所|基金會|協會)`, 'gm'), lead: companyLead, hint: '超维微电子（盐城）有限公司' },
+  addr: { name: '地址', cls: 'addr', re: new RegExp(`[${cn}]{2,12}(?:省|市|縣)[${cn}]{1,10}(?:区|區|县|鄉|鎮)[${cn}\\d\\-]{1,25}?(?:号|號|栋|幢|楼|樓|室)(?:\\d{1,3}[樓楼])?`, 'g'), hint: '盐城市盐都区盐渎路999号、台北市信義區市府路45號8樓' },
+  intl: { name: '国际电话', cls: 'phone', re: /(?<![\w+])\+(?!886)\d{1,3}[\s-]?\(?\d{1,4}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}(?!\d)|(?<![\d(])\(\d{3}\)\s?\d{3}-\d{4}(?!\d)/g, hint: '+86 138 0013 8000、(416) 967-1111' },
+  ssn: { name: '美国社会安全码 (SSN)', cls: 'warn', re: /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)|(?<=SSN[:：#]?\s?)\d{9}(?!\d)/g, hint: '123-45-6789、SSN: 123456789' },
   card: { name: '信用卡号', cls: 'warn', re: /(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)/g, check: luhn, hint: '4242 4242 4242 4242' },
-  iban: { name: 'IBAN 国际银行账号', cls: 'warn', re: /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?\b/g, hint: 'GB82 WEST 1234 5698 7654 32' },
-  ip4: { name: 'IPv4 地址', cls: 'net', re: /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])/g, hint: '192.168.1.10' },
-  ip6: { name: 'IPv6 地址', cls: 'net', re: /(?<![\w:])(?:[A-Fa-f0-9]{1,4}:){1,7}:?(?:[A-Fa-f0-9]{1,4})?(?![\w:])/g, check: (s) => s.includes('::') || (s.match(/:/g) || []).length === 7, hint: '2001:db8::1' },
+  iban: { name: 'IBAN 国际银行账号', cls: 'warn', re: /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?\b/g, check: ibanOk, hint: 'GB82 WEST 1234 5698 7654 32' },
+  ip4: { name: 'IPv4 地址', en: 'intl', cls: 'net', re: /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])/g, hint: '192.168.1.10' },
+  ip6: { name: 'IPv6 地址', en: 'intl', cls: 'net', re: /(?<![\w:])(?:[A-Fa-f0-9]{1,4}:){1,7}:?(?:[A-Fa-f0-9]{1,4})?(?![\w:])/g, check: (s) => s.includes('::') || (s.match(/:/g) || []).length === 7, hint: '2001:db8::1' },
   url: { name: '网址', cls: 'net', re: /https?:\/\/[^\s)）"”'’<>|*]+/g, hint: 'https://example.com' },
-  birth: { name: '出生日期', cls: 'warn', re: /(?<=(?:出生日期|出生年月|生日)[：:]\s?)\d{4}[-年/.]\d{1,2}(?:[-月/.]\d{1,2}日?)?/g, hint: '出生日期：1985-03-14' },
+  birth: {
+    name: '出生日期', cls: 'warn', hint: '出生日期：1985-03-14、DOB: 1985-03-14、Date of Birth: March 14, 1985、出生日期：民國 80 年 5 月 1 日',
+    re: /(?<=(?:出生日期|出生年月|生日|DOB|Date of Birth|Birth ?date|Birthday)[：:]\s*)(?:\d{4}[-年/.]\d{1,2}(?:[-月/.]\d{1,2}日?)?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s\d{1,2},?\s\d{4}|民國\s?\d{1,3}\s?年\s?\d{1,2}\s?月(?:\s?\d{1,2}\s?日)?)/gi,
+  },
 };
 for (const [id, r] of Object.entries(RULES)) r.en ||= id;
 
@@ -74,13 +92,13 @@ export const MAIN = [
 
 // 收进 <details> 的其余规则（来自 cmp1~3 的规则页）
 export const EXTRA = [
+  { id: 'ner_cand', name: '机构产品（备选）', grp: 'open' },
   { id: 'credit', name: '统一社会信用代码' }, { id: 'idcard', name: '身份证号' }, { id: 'cname', name: '姓名（仅头衔）', grp: 'open' },
-  { id: 'company', name: '公司／组织名称', grp: 'open' }, { id: 'addr', name: '地址' }, { id: 'intl', name: '国际电话' },
+  { id: 'company', name: '公司／组织名称', grp: 'open' }, { id: 'addr', name: '地址' }, { id: 'intl', name: '国际电话和 IP' },
   { id: 'ssn', name: '美国社会安全码 (SSN)' }, { id: 'card', name: '信用卡号' }, { id: 'iban', name: 'IBAN 国际银行账号' },
-  { id: 'ip4', name: 'IPv4 地址' }, { id: 'ip6', name: 'IPv6 地址' }, { id: 'url', name: '网址' }, { id: 'birth', name: '出生日期' },
-  { id: 'ner_cand', name: '机构 / 产品（模型备选）' },
+ { id: 'url', name: '网址' }, { id: 'birth', name: '出生日期' },
   { id: 'ner_verify', name: 'NER 窄化公司地址', nn: true }, { id: 'ner_alias', name: 'NER 人名放大（张总 / 小张）', nn: true },
-  { id: 'ner_date', name: 'NER 日期补漏', nn: true, def: true }, { id: 'ner_money', name: 'NER 金额补漏', nn: true },
+  { id: 'ner_date', name: 'NER 日期补漏', nn: true, grp: 'open' }, { id: 'ner_money', name: 'NER 金额补漏', nn: true },
 ].map((x) => ({ def: false, ...x }));
 
 // 脱敏工具（勾选项与 di-app.png 一致）：scope=tools 为行为开关，scope=cats 为 NER 高亮

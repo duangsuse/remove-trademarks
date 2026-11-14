@@ -38,6 +38,8 @@ export const read = async (h) => (await file(h)).arrayBuffer();
 export async function write(h, data) { const w = await h.createWritable(); await w.write(data); await w.close(); }
 // 文件夹里的文件：不存在时返回 null；create 为真则新建（失败照常抛出）
 export const child = (dir, name, create = false) => dir.getFileHandle(name, { create }).catch((e) => { if (create) throw e; return null; });
+// 子文件夹：不存在时返回 null；create 为真则新建
+export const subdir = (dir, name, create = false) => dir.getDirectoryHandle(name, { create }).catch((e) => { if (create) throw e; return null; });
 export async function list(dir) {
   const out = [];
   for await (const [name, h] of dir.entries()) if (h.kind === 'file') out.push({ name, h });

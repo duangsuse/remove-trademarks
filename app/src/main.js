@@ -22,7 +22,11 @@ const HL = ['tag', 'warn', 'place', 'cand', 'black', 'phone', 'mail', 'person', 
 document.head.append(Object.assign(document.createElement('style'), { textContent: HL.map((k) => `::highlight(${k}), .badge.${k}, .row.${k} { background-color: var(--hl-${k}); }`).join('\n') }));
 
 // URL 带 #editor：关闭脱敏功能，当作纯文本投影编辑器（Ctrl+S → _新版.docx）；左栏只剩章节，右栏仅在粘贴时更新
-const EDITOR = location.hash === '#editor';
+// hash：#editor#文件名 / #文件名（选中的文档记在这里，刷新后自动打开）
+const hashArg = decodeURIComponent(location.hash.slice(1)).split('#');
+const EDITOR = hashArg[0] === 'editor';
+const hashFile = (EDITOR ? hashArg.slice(1) : hashArg).join('#');
+const setHash = (name) => history.replaceState(null, '', '#' + (EDITOR ? 'editor#' : '') + encodeURIComponent(name));
 addEventListener('hashchange', () => location.reload());
 document.body.classList.toggle('ed', EDITOR);
 
@@ -74,7 +78,7 @@ const row = (x, scope) => {
     : scope === 'cats' && !TOOLS.some((t) => t.id === x.id) ? `<span class="n" data-n="${x.id}"></span>` : '';
   return `<label title="${esc(ruleCode(x.id))}"><input type="checkbox" data-s="${scope}" data-k="${x.id}" ${state[scope][x.id] ? 'checked' : ''}><span>${x.name}${tail}${x.note ? ` <span class="n">- ${x.note}</span>` : ''}</span></label>`;
 };
-const OPEN_ORDER = ['company', 'patent', 'cname', 'contact'];
+const OPEN_ORDER = ['company', 'patent', 'cname', 'contact', 'ner_cand'];
 function renderLeft() {
   const rest = EXTRA.filter((x) => !x.grp);
   $('catList').innerHTML = MAIN.filter((x) => !x.grp).map((x) => row(x, 'cats')).join('');
@@ -514,6 +518,15 @@ $('gallery').addEventListener('mouseover', (e) => {
   pv.style.left = r.right + 12 + 'px'; pv.style.top = Math.max(8, Math.min(r.top, innerHeight - 320)) + 'px';
 });
 $('gallery').addEventListener('mouseout', (e) => { if (e.target.closest('.thumb')) pv.style.display = 'none'; });
+$('gallery').addEventListener('contextmenu', (e) => { // 右键：在正文里定位该图片（到头后回第一处）
+  const b = e.target.closest('.thumb[data-p]'); if (!b) return;
+  e.preventDefault();
+  const rel = b.dataset.p.replace(/^word\//, '');
+  const occ = (doc.parsed?.images || []).filter((x) => x.path === rel).map((x) => [x.s, x.e]);
+  if (!occ.length) return status('这张图片在正文里没有出现位置（可能在页眉页脚 / 母版里）');
+  locT.kind = 'img'; locT.id = b.dataset.p;
+  locate(occ);
+});
 $('gallery').addEventListener('click', (e) => {
   const b = e.target.closest('.thumb[data-p]'); if (!b) return;
   const p = b.dataset.p;
@@ -522,8 +535,8 @@ $('gallery').addEventListener('click', (e) => {
   renderGallery();
 });
 
-// ---------- 输出：A →（Ctrl+S）→ A_脱敏.docx；A 与 A_脱敏 →（Ctrl+Enter 审阅面板）→ 修订写入 A ----------
-function status(t) { $('status').textContent = t; }
+// ---------- 输出：A →（Ctrl+S）→ 脱敏/A.docx；A 与 脱敏/A →（Ctrl+Enter 审阅面板）→ 修订写入 A ----------
+function status(t) { if (tip) statusText = t; else $('status').textContent = t; }
 function redactions() { // 黑名单 + 替换规则 → md 区间替换 [{s, e, text}]
   const md = ta.value;
   nthMap.clear();
@@ -533,18 +546,20 @@ function finalMd() { // 预览：对原文应用 黑名单 + 替换规则
   return EDITOR ? ta.value : spliceMd(ta.value, redactions());
 }
 const alertList = (title, ws) => { if (ws.length) alert(title + '\n\n' + ws.map((w) => '• ' + w).join('\n')); };
-const outName = () => doc.cur.name.replace(/\.docx$/i, '') + (EDITOR ? '_新版.docx' : '_脱敏.docx');
+const OUT_DIR = '脱敏'; // 输出到 原文件夹/脱敏/原名.docx；编辑器模式仍写 原名_新版.docx
+const outName = () => EDITOR ? doc.cur.name.replace(/\.docx$/i, '') + '_新版.docx' : doc.cur.name;
+const outDir = async (create) => (EDITOR ? doc.dir : doc.dir && (await fs.subdir(doc.dir, OUT_DIR, create)));
 const DOCX_TYPE = [{ description: 'Word', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }];
 let busy = false;
 async function guarded(fn) {
-  if (!doc.parsed) return status('请先打开文件：点右上 ▼ 或把文件夹拖进来');
+  if (!doc.parsed) return status('请先打开文件：点右上 ▲▼ 或把文件夹拖进来');
   if (busy) return;
   busy = true; $('apply').disabled = $('append').disabled = true;
   try { await fn(); } catch (e) { if (e.name !== 'AbortError') { console.error(e); status('失败：' + e.message); } }
   busy = false; $('apply').disabled = $('append').disabled = false;
 }
 
-// 完整应用方案：直接替换（无修订），图片 / 不可见指纹一并处理，写到 原名_脱敏.docx；可反复执行（每次都从原文重新生成）
+// 完整应用方案：直接替换（无修订），图片 / 不可见指纹一并处理，写到 脱敏/原名.docx；可反复执行（每次都从原文重新生成）
 const applyAll = () => guarded(async () => {
   const granted = !!doc.dir && (await fs.allowed(doc.dir, true, true)); // 需在用户手势内先拿权限
   const dropImages = EDITOR ? [] : doc.images.filter((i) => i.replaceable && !doc.keep.has(i.path)).map((i) => i.path);
@@ -553,7 +568,7 @@ const applyAll = () => guarded(async () => {
   d.dropImages(dropImages);
   if (!EDITOR && state.cats.meta) d.wipe();
   const { blob, warnings } = await d.save();
-  const fh = granted ? await fs.child(doc.dir, outName(), true) : await fs.pickSave(outName(), DOCX_TYPE);
+  const fh = granted ? await fs.child(await outDir(true), outName(), true) : await fs.pickSave(outName(), DOCX_TYPE);
   await fs.write(fh, blob);
   doc.outHandle = fh;
   alertList(`已写入 ${fh.name}，但有以下问题：`, warnings);
@@ -561,11 +576,12 @@ const applyAll = () => guarded(async () => {
   status(`已生成 ${fh.name}：${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · Ctrl ⏎ 可生成审阅修订');
 });
 
-// 审阅面板：只读取并对比 A（已载入的原文）与 A_脱敏，差异作为修订写入 A；不看黑名单，也可当 diff 用
+// 审阅面板：只读取并对比 A（已载入的原文）与 脱敏/A，差异作为修订写入 A；不看黑名单，也可当 diff 用
 const reviewToA = () => guarded(async () => {
   if (!(await fs.allowed(doc.cur.h, true, true))) throw new Error('没有写入原文件的权限');
-  let hB = (doc.dir && (await fs.child(doc.dir, outName()))) || doc.outHandle;
-  if (!hB) { status(`未找到 ${outName()}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); hB = await fs.pickFile(DOCX_TYPE); }
+  const od = await outDir(false);
+  let hB = (od && (await fs.child(od, outName()))) || doc.outHandle;
+  if (!hB) { status(`未找到 ${OUT_DIR}/${outName()}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); hB = await fs.pickFile(DOCX_TYPE); }
   const b = await DocxProjection.load(await fs.read(hB));
   const a = await DocxProjection.load(await fs.read(doc.cur.h)); // 现读 A：保留打开后在 Word 里做的修改，上次写入的修订载入时已撤掉
   const stats = a.applyText(b.md, { from: b });
@@ -594,22 +610,44 @@ addEventListener('keydown', (e) => {
 });
 
 // 右上角 badge：选区总数；每次变化显示增量，增量不是 1（说明匹配到了别处或没匹配到）时暂时变黄
-let lastN = null, flash = 0, flashing = false;
+let lastN = null, flash = 0, flashing = false, nerInfo = '', tip = '', statusText = null;
 $('pill').onclick = () => { if (doc.cur) openDoc(doc.entries.indexOf(doc.cur)); };
+const PILL_TIP = '黑名单 + 替换规则命中的位置总数 · 点击：关闭并重新打开当前文档';
+let pillBase = '';
+// pill 只显示计数（+ NER 信息）；控件的 title 悬停提示改在底部状态栏显示
+function renderPill() {
+  const pill = $('pill');
+  pill.textContent = pillBase + (nerInfo && !flashing ? ` · ${nerInfo}` : '');
+}
+function setNerInfo(t) { nerInfo = t; renderPill(); }
 function updatePill() {
   const pill = $('pill'), n = sel.length;
-  pill.title = '黑名单 + 替换规则命中的位置总数 · 点击：关闭并重新打开当前文档';
+  pill.dataset.tip = PILL_TIP;
   if (lastN !== null && n !== lastN) {
     const d = n - lastN;
-    pill.textContent = `${d > 0 ? '+' : ''}${d} 次删除`;
+    pillBase = `${d > 0 ? '+' : ''}${d} 次删除`;
     pill.classList.toggle('hot', d !== 1);
     flashing = true; clearTimeout(flash);
-    flash = setTimeout(() => { flashing = false; pill.classList.remove('hot'); pill.textContent = `总共${lastN}次删除`; }, 1000);
-  } else if (!flashing) pill.textContent = `总共${n}次删除`;
+    flash = setTimeout(() => { flashing = false; pill.classList.remove('hot'); pillBase = `总共${lastN}次删除`; renderPill(); }, 1000);
+  } else if (!flashing) pillBase = `总共${n}次删除`;
   lastN = n;
+  renderPill();
 }
-
-// ---------- 文件：右上 ▼ 选择 / 打开文件夹 ----------
+// 悬停提示：把 title 挪到 data-tip（去掉原生气泡），mouseover / mouseout 时在底部状态栏显示 / 还原
+function showTip(t) {
+  const st = $('status');
+  if (t && !tip) statusText = st.textContent;
+  if (!t && !tip) return;
+  tip = t;
+  st.textContent = t || statusText;
+}
+addEventListener('mouseover', (e) => {
+  const el = e.target.closest?.('[title], [data-tip]');
+  if (el?.hasAttribute('title')) { el.dataset.tip = el.title; el.removeAttribute('title'); }
+  showTip(el?.dataset.tip || '');
+});
+addEventListener('mouseout', (e) => { if (!e.relatedTarget) showTip(''); });
+// ---------- 文件：右上 ▲▼ 选择 / 打开文件夹 ----------
 const shortName = (name) => {
   const stem = name.replace(/\.docx$/i, '');
   let head = stem.split(/\s+/)[0];
@@ -618,7 +656,8 @@ const shortName = (name) => {
 };
 function setFileInfo(name, size) { $('fileInfo').textContent = name ? `${shortName(name)} (${mb(size)})` : '打开文件夹…'; }
 
-async function openDoc(i) {
+async function openDoc(i, auto = false, noNer = false) {
+  if (!auto) batch = false; // 手动切换文档即中止批量
   const ent = doc.entries[i]; if (!ent) return;
   status('读取中…');
   const file = await fs.file(ent.h);
@@ -631,10 +670,11 @@ async function openDoc(i) {
   ta.value = p.md; ta.setSelectionRange(0, 0); ta.scrollTop = 0; state.ner = []; state.on = {}; memo.clear(); 
   doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0; blackEl.value = BlackBox.dump({ own: black().words }); // 保留黑名单词，行号规则属于旧文档故丢弃
   $('title').textContent = ent.name.replace(/\.docx$/i, '');
-  setFileInfo(ent.name, file.size);
-  run(); status('已载入 · Ctrl S → _脱敏.docx · Ctrl ⏎ 审阅面板 → A');
+  setFileInfo(ent.name, file.size); setHash(ent.name);
+  run(); status('已载入 · Ctrl S → 脱敏/{}.docx · Ctrl ⏎ 审阅面板 → A');
   alertList(`${ent.name}：以下内容没有处理`, p.warnings);
-  if (ner.ready()) runNer();
+  if (noNer) { nerAbort?.abort(); setNerInfo(''); $('bannerText').textContent = '已切换文档（未做 NER）：点右上 ▲▼ 重新选中本文档即可识别。'; }
+  else if (ner.ready()) runNer();
 }
 let nerAbort = null;
 const fmtSec = (n) => (n >= 90 ? `${Math.round(n / 60)} 分钟` : `${Math.max(1, Math.round(n))} 秒`);
@@ -644,24 +684,38 @@ async function runNer() {
   const ac = nerAbort = new AbortController();
   const lines = nerLines(doc.orig);
   const base = EDITOR ? '纯文本投影编辑器：直接修改文本，Ctrl+S 保存为 原名_新版.docx；右栏只在首次打开和粘贴时识别。' : '已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。';
-  $('bannerText').textContent = '离线 NER 识别中…';
+  $('bannerText').textContent = '离线 NER 识别中…'; setNerInfo('NER 识别中…');
   const t0 = performance.now();
   try {
     const res = await ner.recognize(lines, (f, i) => {
       const eta = i.etaSec > 1 && f > 0.03 ? ` · 剩约 ${fmtSec(i.etaSec)}` : '';
-      $('bannerText').textContent = `离线 NER 识别中… ${(f * 100) | 0}%${eta}（${ner.backend}${i.tokPerSec ? ` · ${Math.round(i.tokPerSec)} token/s` : ''}）`;
+      setNerInfo(`NER ${(f * 100) | 0}%${eta} · ${ner.backend}${i.tokPerSec ? ` · ${Math.round(i.tokPerSec)} token/s` : ''}`);
       status(`NER ${(f * 100) | 0}%${eta}`);
     }, { signal: ac.signal, onStatus: status });
     if (ac.signal.aborted) return;
     state.ner = res;
-    $('bannerText').textContent = `${base}（NER ${((performance.now() - t0) / 1000).toFixed(1)}s · ${ner.backend}）`;
+    $('bannerText').textContent = base;
+    setNerInfo(`NER ${((performance.now() - t0) / 1000).toFixed(1)}s · ${ner.backend === '待启动' ? '缓存' : ner.backend}`);
     status('NER 完成');
     fs.remember('nercache', ner.cacheExport());
   } catch (e) {
     if (e.name === 'AbortError' || ac.signal.aborted) return;
-    console.error(e); $('bannerText').textContent = 'NER 失败：' + e.message;
+    console.error(e); $('bannerText').textContent = 'NER 失败：' + e.message; setNerInfo(''); batch = false;
   }
   EDITOR ? scanPanels() : run();
+  if (!EDITOR) await nextBatch();
+}
+// 批量缓存：NER 完成时若文件列表 > 4 项，问一次是否把其余文件也依次跑完（结果进 NER 缓存），全自动逐个打开
+let batch = false, batchAsked = false;
+async function nextBatch() {
+  const i = doc.entries.indexOf(doc.cur), left = doc.entries.length - i - 1;
+  if (!batchAsked && doc.entries.length > 4 && left > 0) {
+    batchAsked = true;
+    batch = confirm(`文件列表有 ${doc.entries.length} 项，是否对其余 ${left} 项文件批量缓存 NER 结果？\n（将自动逐个打开并识别，可随时手动切换文件中止）`);
+  }
+  if (!batch) return;
+  if (left > 0) return openDoc(i + 1, true);
+  batch = false; status('批量缓存完成');
 }
 
 // 模型：未载入时右上角 ⚠️
@@ -688,7 +742,7 @@ warn.onclick = async () => {
 
 // 返回文件夹里是否有模型
 async function openFolder(dir) {
-  doc.dir = dir; doc.entries = []; pendingDir = null; let model = null;
+  doc.dir = dir; doc.entries = []; pendingDir = null; batch = batchAsked = false; let model = null;
   fs.remember('dir', dir);
   for (const { name, h } of await fs.list(dir)) {
     if (/\.docx$/i.test(name) && !name.startsWith('~$') && !/(?:_脱敏|-红化)\.docx$/.test(name)) doc.entries.push({ name, h });
@@ -696,7 +750,7 @@ async function openFolder(dir) {
   }
   doc.entries.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
   if (model && !ner.ready()) loadModelFile(model.h, model.name);
-  if (doc.entries.length) await openDoc(0);
+  if (doc.entries.length) await openDoc(Math.max(0, doc.entries.findIndex((e) => e.name === hashFile)));
   else status('该文件夹没有 .docx');
   return !!model;
 }
@@ -708,9 +762,13 @@ async function resumeFolder() { // 继续上次的文件夹：点击时请求权
   pickFolder();
 }
 const menu = $('fileMenu');
-function openMenu() {
-  menu.innerHTML = doc.entries.map((e, i) => `<div data-i="${i}" class="${e === doc.cur ? 'cur' : ''}">${esc(e.name)}</div>`).join('') + '<div class="act" data-act="dir">📂 打开文件夹…</div>';
+async function openMenu() {
+  menu.innerHTML = doc.entries.map((e, i) => `<div data-i="${i}" class="${e === doc.cur ? 'cur' : ''}">${esc(e.name)}<small>${e.size == null ? '' : ' · ' + mb(e.size)}</small></div>`).join('') + '<div class="act" data-act="dir">📂 打开文件夹…</div>';
   menu.hidden = false;
+  for (const [i, e] of doc.entries.entries()) { // 大小按需读取并缓存
+    if (e.size == null) e.size = await Promise.resolve(fs.file(e.h)).then((f) => f.size, () => 0);
+    const el = menu.querySelector(`[data-i="${i}"] small`); if (el) el.textContent = ' · ' + mb(e.size);
+  }
 }
 $('fileSel').addEventListener('click', (e) => {
   const it = e.target.closest('#fileMenu > div');
@@ -719,6 +777,9 @@ $('fileSel').addEventListener('click', (e) => {
   menu.hidden ? openMenu() : (menu.hidden = true);
 });
 addEventListener('click', (e) => { if (!e.target.closest('#fileSel')) menu.hidden = true; });
+// 文件选择框聚焦时 ↑↓：上一个 / 下一个文档，只切换不做 NER
+const step = (d) => { const i = doc.entries.indexOf(doc.cur) + d; if (doc.cur && doc.entries[i]) { menu.hidden = true; openDoc(i, false, true); } };
+$('fileSel').addEventListener('keydown', (e) => { if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); step(e.key === 'ArrowUp' ? -1 : 1); } });
 $('fileSel').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('fileSel').click(); } });
 
 async function handleItems(handles) {
@@ -789,7 +850,7 @@ if (EDITOR) {
   document.title = '文本投影编辑器';
   $('title').textContent = '未打开文件';
   ta.contentEditable = 'plaintext-only';
-  ta.dataset.ph = '把文件夹（含 .docx）拖到这里，或点右上 ▼ 打开文件夹；直接编辑文本，Ctrl+S 保存到 _新版.docx';
+  ta.dataset.ph = '把文件夹（含 .docx）拖到这里，或点右上 ▲▼ 打开文件夹；直接编辑文本，Ctrl+S 保存到 _新版.docx';
   $('bannerText').textContent = '纯文本投影编辑器：脱敏功能已关闭，直接修改文本，Ctrl+S 保存为 原名_新版.docx（只改动有差异的段落）。';
   $('apply').innerHTML = '保存修改<small>（到 _新版.docx）</small>';
   $('apply').title = 'Ctrl+S：把修改后的文本写回 .docx，保存为 原名_新版.docx';

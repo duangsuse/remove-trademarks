@@ -7,10 +7,10 @@
 </head>
 <body>
 <header class="top">
-  <div class="brand"><span id="logo" class="logo" title="点击切换主题：浅色 / 深色 / Omarchy">HD</span><h1>数据集打码工作流</h1><span class="sub">应断网使用 · 用小模型辅助</span></div>
+  <div class="brand"><span id="logo" class="logo" title="点击切换主题：浅色 / 深色 / Omarchy">HD</span><h1>数据集打码工作流</h1><span class="sub">应断网使用 · 小模型尽力帮您</span></div>
   <div class="top-r">
     <button id="modelWarn" class="warnchip" hidden title="点击选择 .onnx 模型文件，或把含模型的文件夹拖进来">⚠️ 离线模型未载入</button>
-    <span id="pill" class="pill" title="">总共0次删除</span>
+    <span id="pill" class="pill">总共0次删除</span>
   </div>
 </header>
 <div class="layout">
@@ -47,10 +47,10 @@
     <h2 id="title">未打开文件</h2>
     <div class="banner" id="banner">
       <span id="bannerText">已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。 【右键点规则/专利号即可在全文中定位】</span>
-      <span id="fileSel" class="filesel mono" tabindex="0" role="button" title="点击选择文件 / 打开文件夹"><i class="tri">▼</i><span id="fileInfo">打开文件夹…</span><div id="fileMenu" class="menu" hidden></div></span>
+      <span id="fileSel" class="filesel mono" tabindex="0" role="button" title="点击选择文件 / 打开文件夹 · 聚焦时按 ↑↓ 只切换文档（不做 NER）"><i class="tri">▼</i><span id="fileInfo">打开文件夹…</span><div id="fileMenu" class="menu" hidden></div></span>
     </div>
     <div class="editor" id="editor">
-      <div id="ta" class="doc" tabindex="0" spellcheck="false" data-ph="把文件夹（含 .docx 与 .onnx 小模型）拖到这里，或点右上 ▼ 打开文件夹"></div>
+      <div id="ta" class="doc" tabindex="0" spellcheck="false" data-ph="把文件夹（含 .docx 与 .onnx 小模型）拖到这里，或点右上 ▲▼ 打开文件夹"></div>
       <div id="chapters" class="chapters" hidden></div>
     </div>
   </main>
@@ -66,9 +66,9 @@
     </div>
     <footer class="foot">
       <div class="sum"><span>要打码的选区</span><b id="sum" class="mono">0 of 0</b></div>
-      <button id="apply" class="primary" title="Ctrl+S：应用黑名单 + 替换规则，直接替换文本（无修订），图片 / 指纹一并处理，写到 原名_脱敏.docx">完整应用脱敏方案<small>（到 _脱敏.docx）</small></button>
-      <button id="append" class="primary alt" title="Ctrl+Enter：读取 A 与 A_脱敏 对比，差异作为修订写入 A（审阅面板）；也可当 diff 用">追加到Word的审阅面板<small>（仅供比对）</small></button>
-      <div class="hint mono" id="status">Ctrl S → 脱敏 · Ctrl ⏎ 审阅面板 · 在 <i class="tri">▼</i> 重新下拉选中即可重来</div>
+      <button id="apply" class="primary" title="Ctrl+S：应用黑名单 + 替换规则，直接替换文本（无修订），图片 / 指纹一并处理，写到 脱敏/原名.docx">完整应用脱敏方案<small>（到 脱敏/{}.docx）</small></button>
+      <button id="append" class="primary alt" title="Ctrl+Enter：读取 A 与 脱敏/A 对比，差异作为修订写入 A（审阅面板）；也可当 diff 用">追加到Word的审阅面板<small>（仅供比对）</small></button>
+      <div class="hint mono" id="status">Ctrl S → 脱敏 · Ctrl ⏎ 审阅面板 · 点右上 ▲▼ 重新选中即可重来</div>
     </footer>
   </aside>
 </div>
