@@ -503,7 +503,7 @@ test('diffSpans：应用后得到新文本；超长行也能算', async () => {
 
 test('diffMd：同一张图片只改说明 = 改 alt；换成别的图片不会逐字错配', async () => {
   const d = await DocxProjection.load(await tabSample());
-  assert.deepEqual(d.diffMd(d.md.replace(imgTok, imgTok.replace('张三', '某'))), { del: 1, ins: 1, skipped: 0 });
+  assert.deepEqual(d.diffMd(d.md.replace(imgTok, imgTok.replace('张三', '某'))), { del: 1, ins: 1, skipped: 0, fmt: 0 });
   const xml = await docXml((await d.save({ type: 'uint8array' })).data);
   assert.match(xml, /descr="某身份证"/);
   assert.equal((xml.match(/<w:drawing>/g) || []).length, 3, '图片本身没动');
@@ -580,7 +580,7 @@ const review = async (A, B, revisions = true) => {
 
 test('拆段：审阅模式下前一段的段落标记是插入，后一段文字不当删除；重新载入撤回原样', async () => {
   const { diff, data, orig } = await review(p(t('一二三四')) + p(t('尾')), p(t('一二')) + p(t('三四')) + p(t('尾')));
-  assert.deepEqual(diff, { del: 0, ins: 1, skipped: 0 });
+  assert.deepEqual(diff, { del: 0, ins: 1, skipped: 0, fmt: 0 });
   assert.deepEqual(await paras(data), ['一二|ins', '三四', '尾']);
   assert.equal((await DocxProjection.load(data)).md, orig);
   const plain = await review(p(t('一二三四')) + p(t('尾')), p(t('一二')) + p(t('三四')) + p(t('尾')), false);
@@ -589,7 +589,7 @@ test('拆段：审阅模式下前一段的段落标记是插入，后一段文�
 
 test('新段：正文末尾 / 两段之间新增的段落是整段插入', async () => {
   let r = await review(p(t('末尾')), p(t('末尾')) + p(t('新段')));
-  assert.deepEqual(r.diff, { del: 0, ins: 1, skipped: 0 });
+  assert.deepEqual(r.diff, { del: 0, ins: 1, skipped: 0, fmt: 0 });
   assert.deepEqual(await paras(r.data), ['末尾|ins', '+新段']);
   assert.equal((await DocxProjection.load(r.data)).md, r.orig);
   r = await review(p(t('标题'), '<w:pStyle w:val="Heading1"/>') + p(t('正文')), p(t('标题'), '<w:pStyle w:val="Heading1"/>') + p(t('新段')) + p(t('正文')));
@@ -599,7 +599,7 @@ test('新段：正文末尾 / 两段之间新增的段落是整段插入', async
 
 test('合并：删掉段落标记；删整段时上一段保持原样', async () => {
   let r = await review(p(t('一二')) + p(t('三四')), p(t('一二三四')));
-  assert.deepEqual(r.diff, { del: 1, ins: 0, skipped: 0 });
+  assert.deepEqual(r.diff, { del: 1, ins: 0, skipped: 0, fmt: 0 });
   assert.deepEqual(await paras(r.data), ['一二|del', '三四']);
   assert.equal((await DocxProjection.load(r.data)).md, r.orig);
   r = await review(p(t('一二')) + p(t('三四')), p(t('一二三四')), false);
@@ -625,7 +625,33 @@ test('空单元格里可以输入', async () => {
   const tbl = `<w:tbl><w:tr>${tc(t('姓名'))}<w:tc><w:p/></w:tc>${tc(t('电话'))}</w:tr></w:tbl>`;
   const d = await DocxProjection.load(await mini(tbl));
   assert.match(d.md, /^\| 姓名 \|  \| 电话 \|$/m);
-  assert.deepEqual(d.mapPlain((s) => s.replace('姓名 |  |', '姓名 | 张三 |')), { del: 0, ins: 1, skipped: 0 });
+  assert.deepEqual(d.mapPlain((s) => s.replace('姓名 |  |', '姓名 | 张三 |')), { del: 0, ins: 1, skipped: 0, fmt: 0 });
   const xml = await docXml((await d.save({ type: 'uint8array', revisions: true })).data);
   assert.match(xml, /<w:tc><w:p><w:ins [^>]*><w:r><w:t[^>]*>张三<\/w:t><\/w:r><\/w:ins><\/w:p><\/w:tc>/);
+});
+
+// ---------- 格式修订 ----------
+test('emphasisOf：按投影写法推算每个字的粗斜体', async () => {
+  const { emphasisOf } = await import('../src/plain.js');
+  const md = '甲**乙***丙*丁\\*戊***己*****庚**\n辛';
+  const f = emphasisOf(md), at = (ch) => f[md.indexOf(ch)];
+  assert.deepEqual(['甲', '乙', '丙', '丁', '戊', '己', '庚', '辛'].map(at), [0, 1, 2, 0, 0, 3, 1, 0]);
+});
+
+test('只改粗斜体：写成格式修订（rPrChange），重新载入撤回原样', async () => {
+  let r = await review(p(t('一二三四')), p(t('一二') + t('三四', true)));
+  assert.deepEqual(r.diff, { del: 0, ins: 0, skipped: 0, fmt: 1 });
+  let xml = await docXml(r.data);
+  assert.match(xml, /<w:rPr><w:b\/><w:rPrChange [^>]*><w:rPr\/><\/w:rPrChange><\/w:rPr><w:t[^>]*>三四</);
+  assert.equal((await DocxProjection.load(r.data)).md, r.orig);
+  r = await review(p(t('一二') + t('三四', true)), p(t('一二三四')));
+  xml = await docXml(r.data);
+  assert.match(xml, /<w:rPr><w:b w:val="0"\/><w:rPrChange [^>]*><w:rPr><w:b\/><\/w:rPr><\/w:rPrChange><\/w:rPr><w:t[^>]*>三四</);
+  assert.equal((await DocxProjection.load(r.data)).md, r.orig);
+  // 编辑器里直接写 Markdown 标记（不带 from），非审阅模式
+  const d = await DocxProjection.load(await mini(p(t('一二三四'))));
+  assert.equal(d.diffMd(d.md.replace('三四', '*三四*')).fmt, 1);
+  const runs = await bodyRuns((await d.save({ type: 'uint8array' })).data);
+  assert.deepEqual(runs, ['一二', '三四']);
+  assert.match(await docXml((await (async () => { const e = await DocxProjection.load(await mini(p(t('一二三四')))); e.diffMd(e.md.replace('三四', '*三四*')); return e.save({ type: 'uint8array' }); })()).data), /<w:i\/><\/w:rPr><w:t[^>]*>三四/);
 });

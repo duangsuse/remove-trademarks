@@ -44,6 +44,21 @@ export function spliceMd(md, reps) {
   return out + md.slice(p);
 }
 
+// md 每个字的粗斜体状态（位 1 粗、位 2 斜），按 * 标记开合推算；换行处归零。
+// 投影在格式切换处写「收 + 开」两个标记（如 粗→斜 写 ** + *），所以连着 n 个 * 翻转的是 [无, 斜, 粗, 粗斜, 粗, 斜][n % 6]
+const FLIP = [0, 2, 1, 3, 1, 2];
+export function emphasisOf(md) {
+  const out = new Uint8Array(md.length);
+  let f = 0;
+  for (let i = 0; i < md.length; i++) {
+    const c = md[i];
+    if (c === '\\' && i + 1 < md.length) { out[i] = out[i + 1] = f; i++; }
+    else if (c === '*') { let j = i; while (md[j] === '*') j++; f ^= FLIP[(j - i) % 6]; for (; i < j; i++) out[i] = f; i--; }
+    else { if (c === '\n') f = 0; out[i] = f; }
+  }
+  return out;
+}
+
 // 第 a~b 行（从 1 起，含 b）的 md 区间 [s, e]，可作 editText 的 range
 export function lineRange(md, a, b = a) {
   const starts = [0];

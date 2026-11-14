@@ -43,9 +43,11 @@ d.unhandled   // 投影不了的元素 [{ tag: 'm:oMath', count: 2 }, …]
 d.locate(i)   // md 第 i 个字属于哪个段落 / 文本单元，可不可编辑
 await d.media() // word/media/* 的图片 [{ path, bytes, mime, replaceable, uses: [{ s, e }] }]
 
-// 三种改法，按输入的层次分；最后都归到 splice，返回本次的 { del, ins, skipped }
+// 三种改法，按输入的层次分；最后都归到 splice，返回本次的 { del, ins, skipped, fmt }
 d.splice([{ s, e, text }])  // md 区间：区间里的可编辑字全删，text 插在第一个被删的字处、用它的格式；s === e 表示纯插入
-d.diffMd(newMd, { from })   // 整份 md：和原投影做 diff，转成 splice；from 是另一个 DocxProjection 时只取它的可编辑字
+                            // text 按纯文本写：\n 分段，\u2028 软换行；区间里删掉段落之间的换行 = 合并段落
+d.diffMd(newMd, { from })   // 整份 md：和原投影做 diff，转成 splice；只改了 ** / * 的地方记成格式修改（fmt）
+                            // from 是另一个 DocxProjection 时只取它的可编辑字
 d.mapPlain(fn, { range })   // 纯文本：fn(txt) => txt'，diff 转成 splice；range = [s, e]（md 坐标）时只把这一段交给 fn
 
 d.blankImages(paths)        // 换成 1×1 占位图
@@ -55,7 +57,8 @@ const { blob, report, warnings } = await d.save();                         // �
 const { data } = await d.save({ type: 'uint8array', revisions: true });    // Node；revisions 表示写成审阅修订
 ```
 
-- `save()` 只能调用一次（会改写 DOM）。`report` 是按实际写入修正过的累计 `{ del, ins, skipped }`。
+- `save()` 只能调用一次（会改写 DOM）。`report` 是按实际写入修正过的累计 `{ del, ins, skipped, fmt }`。
+- `revisions: true` 时所有改动都是 Word 的原生修订：文字插入 / 删除、拆段 / 新段 / 合并（段落标记的修订）、粗斜体（格式修订）。
 - 坐标都按**载入时**的投影算。多次调用 `splice` / `diffMd` / `mapPlain` 的改动会叠加，但后一次看不到前一次的结果。
 - 载入时会先「拒绝」掉本工具以前写进去的审阅修订，所以反复写修订不会越叠越多。
 

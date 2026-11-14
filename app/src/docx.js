@@ -5,7 +5,7 @@
 // 不依赖脱敏逻辑；结构标记、修订作者的默认值来自 markup.js，界面文字见 I18N，都可经 opts 覆盖
 import JSZip from 'jszip';
 import { PROJECTION } from './markup.js';
-import { plainView, plainToSpans, diffSpans, BR } from './plain.js';
+import { plainView, plainToSpans, diffSpans, emphasisOf, BR } from './plain.js';
 
 const NS = {
   WORD: 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
@@ -279,6 +279,14 @@ function rejectOurs(doc, author) {
     while (x.firstChild) x.parentNode.insertBefore(x.firstChild, x);
     x.remove(); n++;
   }
+  // 格式修订：换回 rPrChange 里记的原格式
+  for (const x of byTag('rPrChange')) {
+    const rPr = x.parentNode, old = kid(x, 'rPr');
+    while (rPr.firstChild) rPr.removeChild(rPr.firstChild);
+    for (const c of [...(old?.childNodes || [])]) rPr.appendChild(c);
+    if (!rPr.childNodes.length) rPr.remove();
+    n++;
+  }
   // 段落标记：自己删的去掉删除标记；自己插入的（拆段 / 新段）与下一段合并回去，用下一段的段落属性（拆段时原来的标记留在后一段）
   const marks = (t) => byTag(t).filter((x) => x.parentNode?.localName === 'rPr' && x.parentNode.parentNode?.localName === 'pPr');
   for (const x of marks('del')) { x.remove(); n++; }
@@ -322,7 +330,7 @@ const imgPath = (tok) => (tok.length > 1 && tok.startsWith('![') ? new RegExp(IM
 const IMG_DIFF = { tokens: imgTokens, same: (x, y) => imgPath(x) != null && imgPath(x) === imgPath(y) };
 class Edits extends Map {
   dropped = []; // 被整体删除的图片 { pid, off, path, part }，没被配对到插入处的就是真删除
-  of(pid) { let e = this.get(pid); if (!e) this.set(pid, (e = { del: new Set(), ins: new Map(), drop: new Set(), refs: new Map(), nodes: new Map(), merge: false })); return e; }
+  of(pid) { let e = this.get(pid); if (!e) this.set(pid, (e = { del: new Set(), ins: new Map(), drop: new Set(), refs: new Map(), nodes: new Map(), merge: false, fmt: new Map() })); return e; }
   del(pid, off) { this.of(pid).del.add(off); }
   ins(pid, at, text) {
     const e = this.of(pid), refs = e.refs.get(at) || [];
@@ -331,6 +339,7 @@ class Edits extends Map {
     e.ins.set(at, (e.ins.get(at) || '') + text);
   }
   merge(pid) { this.of(pid).merge = true; } // 删掉段落标记：与下一段合并
+  fmt(pid, off, bits) { this.of(pid).fmt.set(off, bits); } // 改粗斜体：位 1 粗、位 2 斜
   dropObj(img) { const e = this.of(img.pid); if (!e.drop.has(img.off)) { e.drop.add(img.off); this.dropped.push(img); } }
 }
 // md 区间 [a, b) 整个包住的图片（只包住一半的不算：结构字符不可编辑）
@@ -371,6 +380,33 @@ function mkText(doc, name, text) {
   t.setAttributeNS(NS.XML, 'xml:space', 'preserve');
   t.textContent = text;
   return t;
+}
+
+// rPr 子元素的规定顺序（不按顺序 Word 可能报文件损坏）；不认识的（w14: 等扩展）排在 rPrChange 之前
+const RPR_ORDER = ['ins', 'del', 'moveFrom', 'moveTo', 'rStyle', 'rFonts', 'b', 'bCs', 'i', 'iCs', 'caps', 'smallCaps', 'strike', 'dstrike', 'outline', 'shadow', 'emboss', 'imprint', 'noProof', 'snapToGrid', 'vanish', 'webHidden', 'color', 'spacing', 'w', 'kern', 'position', 'sz', 'szCs', 'highlight', 'u', 'effect', 'bdr', 'shd', 'fitText', 'vertAlign', 'rtl', 'cs', 'em', 'lang', 'eastAsianLayout', 'specVanish', 'oMath'];
+const rprRank = (n) => (n.namespaceURI === NS.WORD && RPR_ORDER.includes(n.localName) ? RPR_ORDER.indexOf(n.localName) : n.localName === 'rPrChange' ? 1e9 : 1e8);
+function putRPr(rPr, el) {
+  const r = rprRank(el);
+  rPr.insertBefore(el, [...rPr.childNodes].find((c) => c.nodeType === 1 && rprRank(c) > r) || null);
+}
+// 把 run 的粗斜体从 cur 改成 bits（位 1 粗、位 2 斜，只动变了的位），返回新 rPr；track 时附 w:rPrChange 记下原格式。
+// 别人已经记过 rPrChange 的不再加（原格式以他们记的为准）
+function withFmt(doc, rpr, bits, cur, meta, track) {
+  const n = rpr ? rpr.cloneNode(true) : mkEl(doc, 'rPr');
+  const had = kid(n, 'rPrChange');
+  for (const [name, bit] of [['b', 1], ['i', 2]]) {
+    if (!((bits ^ cur) & bit)) continue;
+    kid(n, name)?.remove();
+    putRPr(n, bits & bit ? mkEl(doc, name) : mkEl(doc, name, { val: '0' }));
+  }
+  if (track && !had) {
+    const old = rpr ? rpr.cloneNode(true) : mkEl(doc, 'rPr');
+    for (const c of [...old.childNodes]) if (c.nodeType === 1 && ['ins', 'del', 'moveFrom', 'moveTo', 'rPrChange'].includes(c.localName)) c.remove();
+    const ch = mkEl(doc, 'rPrChange', meta());
+    ch.appendChild(old);
+    n.appendChild(ch);
+  }
+  return n;
 }
 
 // 段落标记的格式（空段落里插字时用）：pPr > rPr 去掉其中的修订标记
@@ -443,6 +479,7 @@ function applyParaEdits(para, ed, ctx) {
   const lastIdx = atoms.length - 1;
   for (const i of ed.del) if (atoms[i]?.edit) need.add(atoms[i].r);
   for (const i of ed.drop) need.add(atoms[i].r);
+  for (const i of ed.fmt.keys()) if (atoms[i]?.edit) need.add(atoms[i].r);
   if (lastIdx >= 0) for (const at of ed.ins.keys()) need.add(atoms[Math.min(at, lastIdx)].r);
   const rprClones = new Map();
   for (const a of atoms) if (!rprClones.has(a.r)) rprClones.set(a.r, kid(a.r, 'rPr')?.cloneNode(true) || null);
@@ -504,16 +541,16 @@ function applyParaEdits(para, ed, ctx) {
         }
         continue;
       }
-      let buf = '', bufDel = false;
+      let buf = '', bufKey = ''; // 'd' 删除，'f' + 目标位 + 现有位 改格式，'' 原样
       const flush = () => {
         if (!buf) return;
-        push(bufDel ? delNode(r, rpr, buf) : mkRun(r, rpr, mkText(doc, 't', buf)));
+        push(bufKey === 'd' ? delNode(r, rpr, buf) : mkRun(r, bufKey ? withFmt(doc, rpr, +bufKey[1], +bufKey[2], meta, ctx.track) : rpr, mkText(doc, 't', buf)));
         buf = '';
       };
       for (const [a, gi] of list) {
         if (ed.ins.has(gi)) { flush(); push(insNode(r, gi, ed.ins.get(gi))); }
-        const d = ed.del.has(gi) && a.edit;
-        if (d !== bufDel) { flush(); bufDel = d; }
+        const k = a.edit && ed.del.has(gi) ? 'd' : a.edit && ed.fmt.has(gi) ? 'f' + ed.fmt.get(gi) + ((a.fmt.includes('b') ? 1 : 0) | (a.fmt.includes('i') ? 2 : 0)) : '';
+        if (k !== bufKey) { flush(); bufKey = k; }
         buf += a.ch;
         if (gi === lastIdx && ed.ins.has(atoms.length)) { flush(); push(insNode(r, atoms.length, ed.ins.get(atoms.length))); }
       }
@@ -583,7 +620,7 @@ export class DocxProjection {
   #textParts = []; // 正文 + 页眉页脚脚注尾注
   #units = []; // 段落 {kind:'para', el, part, atoms} 或文本单元 {kind:'text', part, atoms, set}
   #map = null; // md 每个字符 -> {pid 单元, off 单元内位置, ed 可编辑, aft 紧跟其后插入的位置}（见 MD）
-  #stats = { del: 0, ins: 0, skipped: 0 }; // 各次编辑累计，save 再按实际写入修正成 report
+  #stats = { del: 0, ins: 0, skipped: 0, fmt: 0 }; // 各次编辑累计，save 再按实际写入修正成 report
   #edits = new Edits();
   #mirrors = [];
   #blank = [];
@@ -615,7 +652,7 @@ export class DocxProjection {
   // 按 md 区间替换 [{s, e, text}]：区间内可编辑字符全删，text 插在第一个被删的字处、用它的格式；s === e 为纯插入。
   // text 按纯文本写：\n 分段（连着几个算一个），\u2028 软换行，\t 制表。区间里段落之间的换行被删 = 与下一段合并
   splice(spans) {
-    const map = this.#map, { pid, off, ed, brk } = map, st = { del: 0, ins: 0, skipped: 0 };
+    const map = this.#map, { pid, off, ed, brk } = map, st = { del: 0, ins: 0, skipped: 0, fmt: 0 };
     for (const { s, e, text: raw = '' } of spans) {
       let first = -1;
       const gone = coveredImgs(this.images, s, e);
@@ -654,18 +691,33 @@ export class DocxProjection {
     return out;
   }
 
-  // 拿改过的整份 md 做 diff，差异作为区间替换交给 splice。from：新 md 来自另一个 DocxProjection 时传入，只取它的可编辑字符（和整张图片）
+  // 拿改过的整份 md 做 diff，差异作为区间替换交给 splice；没改的字若粗斜体变了，记成格式修改。
+  // from：新 md 来自另一个 DocxProjection 时传入，只取它的可编辑字符（和整张图片）
   diffMd(newMd, { from = null } = {}) {
-    const content = contentOf(newMd, from && { ed: from.#map.ed, brk: from.#map.brk, images: from.images });
-    const spans = [], st = { del: 0, ins: 0, skipped: 0 };
-    for (const x of diffSpans(this.md, newMd, IMG_DIFF)) {
+    const B = from && { ed: from.#map.ed, brk: from.#map.brk, images: from.images };
+    const content = contentOf(newMd, B), diffs = diffSpans(this.md, newMd, IMG_DIFF);
+    const spans = [], st = { del: 0, ins: 0, skipped: 0, fmt: 0 };
+    for (const x of diffs) {
+      if (/^\**$/.test(this.md.slice(x.s, x.e)) && /^\**$/.test(x.text)) continue; // 只动了粗斜体标记：下面按格式比
       const text = content(x.at, x.text.length);
-      if (x.text && !text && x.e === x.s) st.skipped++; // 只插入了结构字符（标记、换段等）
+      if (x.text && !text && x.e === x.s) st.skipped++; // 只插入了结构字符（如表格竖线）
       spans.push({ s: x.s, e: x.e, text });
     }
+    // 两边都有的字：比粗斜体（空白不比，投影里空白沿用相邻字的格式）
+    const { pid, off, ed } = this.#map, fa = emphasisOf(this.md), fb = emphasisOf(newMd);
+    let prev = 0, delta = 0, run = false;
+    const same = (a, b) => {
+      for (let i = a; i < b; i++) {
+        const j = i + delta, hit = ed[i] && (!B || B.ed[j]) && !/\s/.test(this.md[i]) && fa[i] !== fb[j];
+        if (hit) { this.#edits.fmt(pid[i], off[i], fb[j]); if (!run) st.fmt++; }
+        if (ed[i]) run = hit;
+      }
+    };
+    for (const x of diffs) { same(prev, x.s); run = false; delta += x.text.length - (x.e - x.s); prev = x.e; }
+    same(prev, this.md.length);
     this.#count(st);
     const r = this.splice(spans);
-    r.skipped += st.skipped;
+    r.skipped += st.skipped; r.fmt = st.fmt;
     return r;
   }
 
