@@ -83,11 +83,11 @@ export const MAIN = [
   { id: 'img', name: '默认不保留图片' },
   { id: 'meta', name: '.docx 不可见指纹抹除', info: FINGERPRINT_URL },
   { id: 'black', name: '黑名单词汇' },
-  { id: 'abbr', name: '简称词汇打码', def: false },
-  { id: 'patent', name: 'ZL专利号打码', note: '请手动复核', grp: 'open' },
+  { id: 'abbr', name: '简称词汇打码', def: false, grp: 'open' },
+  { id: 'patent', name: 'ZL专利号打码', note: '请手动复核' },
   { id: 'tblname', name: '含姓名的表格', note: '请手动复核' },
-  { id: 'date', name: '日期和百分比', def: false },
-  { id: 'contact', name: '电话和关联实体', grp: 'open' },
+  { id: 'date', name: '日期和百分比', def: false, grp: 'open' },
+  { id: 'contact', name: '电话和关联实体' },
 ];
 
 // 收进 <details> 的其余规则（来自 cmp1~3 的规则页）
@@ -98,7 +98,7 @@ export const EXTRA = [
   { id: 'ssn', name: '美国社会安全码 (SSN)' }, { id: 'card', name: '信用卡号' }, { id: 'iban', name: 'IBAN 国际银行账号' },
  { id: 'url', name: '网址' }, { id: 'birth', name: '出生日期' },
   { id: 'ner_verify', name: 'NER 窄化公司地址', nn: true }, { id: 'ner_alias', name: 'NER 人名放大（张总 / 小张）', nn: true },
-  { id: 'ner_date', name: 'NER 日期补漏', nn: true, grp: 'open' }, { id: 'ner_money', name: 'NER 金额补漏', nn: true },
+  { id: 'ner_date', name: 'NER 日期补漏', nn: true, grp: 'open' }, { id: 'ner_money', name: 'NER 金额补漏', grp: 'open', nn: true },
 ].map((x) => ({ def: false, ...x }));
 
 // 脱敏工具（勾选项与 di-app.png 一致）：scope=tools 为行为开关，scope=cats 为 NER 高亮

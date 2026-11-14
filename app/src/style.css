@@ -1,7 +1,7 @@
 /* 主题：浅色（默认）/ dark / omarchy，点 logo 轮换。--hl-<类别> 为正文高亮与芯片底色，类别见 rules.js 的 cls（::highlight 规则由 main.js 按 HL 生成） */
 :root {
   --bg: #e9e5d6; --panel: #f3efe0; --line: #d6d0bb; --text: #3b3a35; --mute: #7d7a6c; --primary: #3f6f8f; --primary-t: #f6f2e4;
-  --soft: #dde3d8; --ok: #5a7a2c; --ok-bg: #dfe5c8; --warn-bg: #efe0b8; --warn: #a8691a;
+  --soft: #dde3d8; --ok: #5a7a2c; --ok-bg: #dfe5c8; --warn-bg: #efe0b8; --warn: #a8691a; --bad: #b3261e;
   --hl-tag: #e8d48a; --hl-warn: #e6b5a6; --hl-place: #b9cfd8; --hl-cand: #e6c79c; --hl-black: #d3c4de; --hl-phone: #c3c8ee; --hl-mail: #d6c3dc; --hl-person: #e3bccb;
   --hl-company: #efc890; --hl-addr: #bccbec; --hl-date: #ddd3b8; --hl-net: #c8d2da; --hl-abbr: #dcd59e; --hl-custom: #b9dcd6; --hl-top1: #f2a97e; --hl-top2: #9fd8cf; --hl-top3: #d9b3f0; --hl-frame: #cfe0c4;
   --editor: #f6f2e4; --shadow: 0 1px 2px rgba(60,50,20,.08);
@@ -11,7 +11,7 @@
 }
 :root[data-theme="dark"] {
   --bg: #0f1420; --panel: #171e2e; --line: #28324a; --text: #e6ebf7; --mute: #8e9ab5; --primary: #4c7dff; --primary-t: #fff;
-  --soft: #1b2745; --ok: #55d68a; --ok-bg: #12301f; --warn-bg: #2b2412; --warn: #f0a93a;
+  --soft: #1b2745; --ok: #55d68a; --ok-bg: #12301f; --warn-bg: #2b2412; --warn: #f0a93a; --bad: #ff6b5e;
   --hl-tag: #6b5a12; --hl-warn: #6d2a26; --hl-place: #25427a; --hl-cand: #6d4516; --hl-black: #48307a; --hl-phone: #2c3a7a; --hl-mail: #4a2d73; --hl-person: #7a2d53;
   --hl-company: #75520f; --hl-addr: #1f4f7a; --hl-date: #4f4630; --hl-net: #34404f; --hl-abbr: #4f4a1a; --hl-custom: #1d4f4f; --hl-top1: #8a3d12; --hl-top2: #0f5a52; --hl-top3: #5a2a7a; --hl-frame: #2f4f2a;
   --editor: #131a28; --shadow: none;
@@ -20,7 +20,7 @@
 /* Omarchy：Everforest 配色、直角、等宽字体、无阴影，聚焦处强调色描边（见文末） */
 :root[data-theme="omarchy"] {
   --bg: #232a2e; --panel: #2d353b; --line: #475258; --text: #d3c6aa; --mute: #859289; --primary: #7fbbb3; --primary-t: #2d353b;
-  --soft: #343f44; --ok: #a7c080; --ok-bg: #425047; --warn-bg: #4d4c43; --warn: #dbbc7f;
+  --soft: #343f44; --ok: #a7c080; --ok-bg: #425047; --warn-bg: #4d4c43; --warn: #dbbc7f; --bad: #e67e80;
   --hl-tag: #5a5a3e; --hl-warn: #6b3f44; --hl-place: #3a515d; --hl-cand: #5c4a36; --hl-black: #4a444e; --hl-phone: #3d4a66; --hl-mail: #54466a; --hl-person: #63415a;
   --hl-company: #5f5236; --hl-addr: #34506a; --hl-date: #4d4c43; --hl-net: #3f4b52; --hl-abbr: #545032; --hl-custom: #2f554f; --hl-top1: #6b4a32; --hl-top2: #2f5a4a; --hl-top3: #5a3f6b; --hl-frame: #3f5a3a;
   --editor: #272e33; --shadow: none;
@@ -61,6 +61,7 @@ code { background: var(--soft); padding: 0 4px; border-radius: var(--r-s); }
 
 .center { display: flex; flex-direction: column; min-width: 0; padding: 14px 20px 14px; gap: 10px; }
 #title { margin: 0; font-size: 20px; }
+#title.tainted { color: var(--bad); } /* 脱敏/A 里写了原文修订，Ctrl+S 前不能外发 */
 .banner { display: flex; justify-content: space-between; gap: 12px; background: var(--soft); color: var(--primary); border: 1px solid color-mix(in srgb, var(--primary) 25%, transparent); border-left: 4px solid var(--primary); padding: 10px 14px; border-radius: var(--r-m); font-size: 14px; }
 .banner .mono { color: var(--mute); font-size: 12px; white-space: nowrap; }
 .editor { position: relative; flex: 1; min-height: 0; background: var(--editor); border: 1px solid var(--line); border-radius: var(--r-m); box-shadow: var(--shadow); overflow: hidden; }

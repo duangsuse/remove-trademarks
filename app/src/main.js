@@ -21,7 +21,7 @@ $('logo').onclick = () => { root.dataset.theme = THEMES[(THEMES.indexOf(root.dat
 const HL = ['tag', 'warn', 'place', 'cand', 'black', 'phone', 'mail', 'person', 'company', 'addr', 'date', 'net', 'abbr', 'custom', 'top1', 'top2', 'top3', 'frame'];
 document.head.append(Object.assign(document.createElement('style'), { textContent: HL.map((k) => `::highlight(${k}), .badge.${k}, .row.${k} { background-color: var(--hl-${k}); }`).join('\n') }));
 
-// URL 带 #editor：关闭脱敏功能，当作纯文本投影编辑器（Ctrl+S → _新版.docx）；左栏只剩章节，右栏仅在粘贴时更新
+// URL 带 #editor：关闭脱敏功能，当作纯文本投影编辑器（Ctrl+S → 新版/原名.docx）；左栏只剩章节，右栏仅在粘贴时更新
 // hash：#editor#文件名 / #文件名（选中的文档记在这里，刷新后自动打开）
 const hashArg = decodeURIComponent(location.hash.slice(1)).split('#');
 const EDITOR = hashArg[0] === 'editor';
@@ -540,7 +540,7 @@ $('gallery').addEventListener('click', (e) => {
   renderGallery();
 });
 
-// ---------- 输出：A →（Ctrl+S）→ 脱敏/A.docx；A 与 脱敏/A →（Ctrl+Enter 审阅面板）→ 修订写入 A ----------
+// ---------- 输出：A →（Ctrl+S）→ 脱敏/A.docx；A 与 脱敏/A →（Ctrl+Enter 审阅面板）→ 修订写入 脱敏/A（原文 A 不动） ----------
 function status(t) { if (tip) statusText = t; else $('status').textContent = t; }
 function redactions() { // 黑名单 + 替换规则 → md 区间替换 [{s, e, text}]
   const md = ta.value;
@@ -551,9 +551,9 @@ function finalMd() { // 预览：对原文应用 黑名单 + 替换规则
   return EDITOR ? ta.value : spliceMd(ta.value, redactions());
 }
 const alertList = (title, ws) => { if (ws.length) alert(title + '\n\n' + ws.map((w) => '• ' + w).join('\n')); };
-const OUT_DIR = '脱敏'; // 输出到 原文件夹/脱敏/原名.docx；编辑器模式仍写 原名_新版.docx
-const outName = () => EDITOR ? doc.cur.name.replace(/\.docx$/i, '') + '_新版.docx' : doc.cur.name;
-const outDir = async (create) => (EDITOR ? doc.dir : doc.dir && (await fs.subdir(doc.dir, OUT_DIR, create)));
+// 输出到 原文件夹/脱敏/原名.docx，编辑器模式写 原文件夹/新版/原名.docx；审阅面板按 新版 ?? 脱敏 ?? 手选 找 B
+const OUT_DIRS = ['新版', '脱敏'], OUT_DIR = EDITOR ? OUT_DIRS[0] : OUT_DIRS[1];
+const outDir = async (create, name = OUT_DIR) => doc.dir && (await fs.subdir(doc.dir, name, create));
 const DOCX_TYPE = [{ description: 'Word', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }];
 let busy = false;
 async function guarded(fn) {
@@ -573,10 +573,12 @@ const applyAll = () => guarded(async () => {
   d.blankImages(dropImages);
   if (!EDITOR && state.cats.meta) d.wipeMetadata();
   const { blob, report: stats, warnings } = await d.save();
-  const fh = granted ? await fs.child(await outDir(true), outName(), true) : await fs.pickSave(outName(), DOCX_TYPE);
+  const fh = granted ? await fs.child(await outDir(true), doc.cur.name, true) : await fs.pickSave(doc.cur.name, DOCX_TYPE);
   await fs.write(fh, blob);
   doc.outHandle = fh;
   const mh = granted && !EDITOR ? await saveManual() : null; // 没有文件夹权限（另存为）时不写
+  reviewed.delete(doc.cur.name); markTitle();
+  if (granted && !reviewed.size) (await outDir(false))?.removeEntry(WARN_FILE).catch(() => {}); // 本会话没有别的带修订文档了，撤掉外发警示
   alertList(`已写入 ${fh.name}，但有以下问题：`, warnings);
   if (EDITOR) return status(`已保存 ${fh.name}：${stats.del} 删 / ${stats.ins} 插` + (stats.skipped ? `，${stats.skipped} 处无法映射` : ''));
   status(`已生成 ${fh.name}：${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + (mh ? ` · 手动修正/${mh.name}` : '') + ' · Ctrl ⏎ 可生成审阅修订');
@@ -614,36 +616,45 @@ function restoreOn() {
   return n > 0;
 }
 
-// 审阅面板：只读取并对比 A（已载入的原文）与 脱敏/A，差异作为修订写入 A；不看黑名单，也可当 diff 用
-const reviewToA = () => guarded(async () => {
-  if (!(await fs.allowed(doc.cur.h, true, true))) throw new Error('没有写入原文件的权限');
-  const od = await outDir(false);
-  let hB = (od && (await fs.child(od, outName()))) || doc.outHandle;
-  if (!hB) { status(`未找到 ${OUT_DIR}/${outName()}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); hB = await fs.pickFile(DOCX_TYPE); }
-  const b = await DocxProjection.load(await fs.read(hB));
-  const a = await DocxProjection.load(await fs.read(doc.cur.h)); // 现读 A：保留打开后在 Word 里做的修改，上次写入的修订载入时已撤掉
-  const diff = a.diffMd(b.md, { from: b });
-  // 图片：B 里内容变了的媒体文件（如图库换成的占位图），在 A 里写成「原图删除 + 新图插入」
-  const bm = new Map((await b.media()).map((x) => [x.path, x.bytes]));
+// 审阅面板：对比 A（原文）与 脱敏/A，把 B -> A 的差异作为修订写入 脱敏/A；原文 A 一个字节都不改。不看黑名单，也可当 diff 用。
+// 写入后 B 里带着原文（修订），标题标红，直到下次 Ctrl+S 重新生成 B
+const WARN_FILE = 'DO_NOT_SEND-有文件含敏感信息.inf'; // 写入修订后放在 B 的文件夹里，提醒别外发
+const reviewed = new Set(); // 写过修订、还没重新 Ctrl+S 的文档名
+const markTitle = () => $('title').classList.toggle('tainted', !!doc.cur && reviewed.has(doc.cur.name));
+const reviewToB = () => guarded(async () => {
+  if (doc.dir && !(await fs.allowed(doc.dir, true, true))) throw new Error('没有写入文件夹的权限'); // 须在按键 / 点击里先拿权限
+  let hB = null, bDir = null;
+  for (const name of OUT_DIRS) { const od = await outDir(false, name); if ((hB = od && (await fs.child(od, doc.cur.name)))) { bDir = od; break; } }
+  hB ||= doc.outHandle;
+  if (!hB) { status(`未找到 ${OUT_DIRS.map((d) => d + '/' + doc.cur.name).join(' 或 ')}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); hB = await fs.pickFile(DOCX_TYPE); }
+  if (!(await fs.allowed(hB, true, true))) throw new Error(`没有写入 ${hB.name} 的权限`);
+  const a = await DocxProjection.load(await fs.read(doc.cur.h)); // 现读 A：保留打开后在 Word 里做的修改
+  const b = await DocxProjection.load(await fs.read(hB)); // 上次写入 B 的修订载入时已撤掉，回到 Ctrl+S 生成时的样子
+  const diff = b.diffMd(a.md, { from: a });
+  // 图片：A 里内容不同的媒体文件（如 B 里换成的占位图），在 B 里写成「占位图删除 + 原图插入」
+  const am = new Map((await a.media()).map((x) => [x.path, x.bytes]));
   const sameBytes = (x, y) => x.length === y.length && x.every((v, i) => v === y[i]);
-  const swapped = (await a.media()).filter((x) => bm.has(x.path) && !sameBytes(x.bytes, bm.get(x.path))).map((x) => ({ path: x.path, bytes: bm.get(x.path) }));
-  const imgs = a.replaceImages(swapped);
-  if (!diff.del && !diff.ins && !diff.fmt && !imgs) return status(diff.skipped ? `${doc.cur.name} 与 ${hB.name} 有 ${diff.skipped} 处差异无法写成修订，未写入` : `${doc.cur.name} 与 ${hB.name} 没有差异，未写入`);
-  const { blob, report: stats, warnings } = await a.save({ revisions: true });
-  await fs.write(doc.cur.h, blob);
-  alertList(`已写入 ${doc.cur.name}，但有以下问题：`, warnings);
-  status(`已把 ${hB.name} 的差异写入 ${doc.cur.name}：${stats.del} 处删除 / ${stats.ins} 处插入` + (stats.fmt ? ` / ${stats.fmt} 处格式` : '') + (imgs ? ` / ${imgs} 处图片` : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · 请在 Word 审阅面板检查后保存');
+  const swapped = (await b.media()).filter((x) => am.has(x.path) && !sameBytes(x.bytes, am.get(x.path))).map((x) => ({ path: x.path, bytes: am.get(x.path) }));
+  const imgs = b.replaceImages(swapped);
+  if (!diff.del && !diff.ins && !diff.fmt && !imgs) return status(diff.skipped ? `${hB.name} 与原文有 ${diff.skipped} 处差异无法写成修订，未写入` : `${hB.name} 与原文没有差异，未写入`);
+  const { blob, report: stats, warnings } = await b.save({ revisions: true });
+  await fs.write(hB, blob);
+  reviewed.add(doc.cur.name); markTitle();
+  const warnDir = bDir || doc.dir; // B 所在文件夹（手选的文件取不到父目录，退回原文件夹）
+  if (warnDir) await fs.write(await fs.child(warnDir, WARN_FILE, true), `${WARN_FILE}\n\n本文件夹里的 ${hB.name} 以修订形式带着原文（敏感信息），不能外发。\n重新 Ctrl+S 生成后确认无误，再手动删除本文件。\n`);
+  alertList(`已写入 ${hB.name}，但有以下问题：\n`, warnings);
+  status(`${stats.del} 处删除 / ${stats.ins} 处插入` + (stats.fmt ? ` / ${stats.fmt} 处格式` : '') + (imgs ? ` / ${imgs} 处图片` : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : ''));
 });
 $('apply').onclick = applyAll;
-$('append').onclick = reviewToA;
+$('append').onclick = reviewToB;
 addEventListener('keydown', (e) => {
   if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 't' && !EDITOR && !e.target.closest?.('input:not([type=checkbox]), textarea:not([readonly]), [contenteditable]')) { // T：开关章节浮框
     const cb = document.querySelector('[data-k="chapter"]'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change', { bubbles: true })); return;
   }
   if (!(e.ctrlKey || e.metaKey)) return;
   const k = e.key.toLowerCase();
-  if (EDITOR && k !== 's') return; // 编辑器模式：撤销交给文本框自带
-  if (e.key === 'Enter') { e.preventDefault(); reviewToA(); }
+  if (EDITOR && k !== 's' && e.key !== 'Enter') return; // 编辑器模式：撤销交给文本框自带
+  if (e.key === 'Enter') { e.preventDefault(); reviewToB(); }
   else if (k === 's') { e.preventDefault(); applyAll(); }
   else if (k === 'z' || k === 'y') {
     if (e.target.closest?.('#addBox, #custom')) return;
@@ -720,10 +731,10 @@ async function openDoc(i, auto = false, noNer = false) {
   doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0;
   await loadManual(ent); // 有存档就以存档为准，否则保留黑名单词（行号规则属于旧文档故丢弃）
   if (!saved) blackEl.value = BlackBox.dump({ own: black().words });
-  $('title').textContent = ent.name.replace(/\.docx$/i, '');
+  $('title').textContent = ent.name.replace(/\.docx$/i, ''); markTitle();
   setFileInfo(ent.name, file.size); setHash(ent.name);
   run(); if (restoreOn()) run();
-  status(saved ? '已载入 · 已读回 手动修正/' + manualName() : '已载入 · Ctrl S → 脱敏/{}.docx · Ctrl ⏎ 审阅面板 → A');
+  status(saved ? '已载入 · 已读回 手动修正/' + manualName() : `已载入 · Ctrl S → ${OUT_DIR}/{}.docx · Ctrl ⏎ 审阅面板 → ${OUT_DIR}/{}.docx`);
   alertList(`${ent.name}：以下内容没有处理`, p.warnings);
   if (noNer) { nerAbort?.abort(); setNerInfo(''); $('bannerText').textContent = '已切换文档（未做 NER）：点右上 ▲▼ 重新选中本文档即可识别。'; }
   else if (ner.ready()) runNer();
@@ -735,7 +746,7 @@ async function runNer() {
   nerAbort?.abort(); // 切换文档 / 重新识别时，丢弃上一轮
   const ac = nerAbort = new AbortController();
   const lines = nerLines(doc.orig);
-  const base = EDITOR ? '纯文本投影编辑器：直改docx内文本，Ctrl+S 保存为 原名_新版.docx；右栏用于手工修订' : '已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。【右键点规则/专利号即可在全文中定位】';
+  const base = EDITOR ? '纯文本投影编辑器：直改docx内文本，Ctrl+S 保存为 新版/原名.docx；右栏用于手工修订' : '已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。【右键点规则/专利号即可在全文中定位】';
   $('bannerText').textContent = '离线 NER 识别中…'; setNerInfo('NER 识别中…');
   const t0 = performance.now();
   try {
@@ -903,11 +914,11 @@ if (EDITOR) {
   document.title = '文本投影编辑器';
   $('title').textContent = '未打开文件';
   ta.contentEditable = 'plaintext-only';
-  ta.dataset.ph = '把文件夹（含 .docx）拖到这里，或点右上 ▲▼ 打开文件夹；直接编辑文本，Ctrl+S 保存到 _新版.docx';
-  $('bannerText').textContent = '纯文本投影编辑器：脱敏功能已关闭，直接修改文本，Ctrl+S 保存为 原名_新版.docx（只改动有差异的段落）。';
-  $('apply').innerHTML = '保存修改<small>（到 _新版.docx）</small>';
-  $('apply').title = 'Ctrl+S：把修改后的文本写回 .docx，保存为 原名_新版.docx';
-  $('status').textContent = 'Ctrl S → _新版.docx · 右栏仅在粘贴时更新';
+  ta.dataset.ph = '把文件夹（含 .docx）拖到这里，或点右上 ▲▼ 打开文件夹；直接编辑文本，Ctrl+S 保存到 新版/原名.docx';
+  $('bannerText').textContent = '纯文本投影编辑器：脱敏功能已关闭，直接修改文本，Ctrl+S 保存为 新版/原名.docx（只改动有差异的段落）。';
+  $('apply').innerHTML = '保存修改<small>（到 新版/原名.docx）</small>';
+  $('apply').title = 'Ctrl+S：把修改后的文本写回 .docx，保存为 新版/原名.docx';
+  $('status').textContent = 'Ctrl S → 新版/ · Ctrl ⏎ 审阅面板 → 新版/ · 右栏仅在粘贴时更新';
   document.querySelector('.left').prepend($('chapters'));
   ta.addEventListener('input', () => refresh());
   ta.addEventListener('paste', (e) => { // 右栏：只在粘贴时更新——对粘贴内容做 NER，再对全文重新识别
@@ -932,5 +943,5 @@ function scanPanels() {
   updateCounts(); renderPanels();
 }
 
-window.__di = { ruleNth, rules: rulesApi, openDoc, state, ta, run, ner, fs, DocxProjection, lineRange, doc, boxAdd, edit, undo, redo, finalMd, redactions, applyAll, reviewToA, get items() { return items; }, get sel() { return sel; } };
+window.__di = { ruleNth, rules: rulesApi, openDoc, state, ta, run, ner, fs, DocxProjection, lineRange, doc, boxAdd, edit, undo, redo, finalMd, redactions, applyAll, reviewToB, get items() { return items; }, get sel() { return sel; } };
 run();
