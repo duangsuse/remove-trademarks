@@ -26,11 +26,11 @@ const TEXT_PARTS = ['header', 'footer', 'footnotes', 'endnotes'];
 // 界面文字，opts.i18n 按组覆盖：{ parts: { header: 'Header' }, warn: { noMain: (p) => … } }
 export const I18N = {
   parts: { header: '页眉', footer: '页脚', footnotes: '脚注', endnotes: '尾注', textbox: '文本框', chart: '图表', smartart: 'SmartArt' },
-  notes: { oMath: '公式', oMathPara: '公式', ruby: '注音', altChunk: '嵌入的外部文档', object: 'OLE 对象' }, // unhandled 里各标签的说明
+  notes: { oMath: '公式', oMathPara: '公式', ruby: '注音', altChunk: '嵌入的外部文档', object: 'OLE 对象', t: '没投影到的文字', comment: '批注' }, // unhandled 里各标签的说明
   warn: {
     parseFailed: (path) => `${path} 解析失败，其中的文字没有处理`,
     noMain: (path) => `找不到正文 ${path}`,
-    unhandled: (list) => '以下元素没有投影，其中的文字没有处理：\n' + list.map(({ tag, count, note }) => `    <${tag}> ×${count}` + (note ? `（${note}）` : '')).join('\n'),
+    unhandled: (list) => '以下元素没有投影，其中的文字没有处理：\n' + list.map(({ tag, count, note, sample }) => `    <${tag}> ×${count}` + (note ? `（${note}${sample ? '，如「' + (sample.length > 20 ? sample.slice(0, 20) + '…' : sample) + '」' : ''}）` : '')).join('\n'),
     embeddings: (n) => `有 ${n} 个内嵌对象（Excel / Visio / 图表数据等，word/embeddings/），里面的内容原样保留`,
     vectors: (n) => `有 ${n} 张 svg / emf 等格式的图片不能替换成占位图（svg 常与同名 png 成对，只换 png 时 Word 仍显示 svg）`,
     newImages: (n) => `${n} 处新增图片被忽略（图片只能删除、移动或复制文档里已有的：路径须与原图相同，且在同一部分——正文 / 页眉等不能互相搬）`,
@@ -226,20 +226,26 @@ function emitPara(md, para, prefix = '', lineStart = false) {
   if (link) closeLink(atoms.length);
 }
 
+// 表格的行 / 行里的格：穿过内容控件（w:sdt > w:sdtContent）与 w:customXml 包装（表单的「重复节」会把整行包在 sdt 里）
+function unwrap(n, name) {
+  const out = [];
+  for (const c of n?.childNodes || []) {
+    if (isW(c, name)) out.push(c);
+    else if (isW(c, 'sdt')) out.push(...unwrap(kid(c, 'sdtContent'), name));
+    else if (isW(c, 'customXml')) out.push(...unwrap(c, name));
+  }
+  return out;
+}
+
 function plainTable(tbl) {
-  const rows = kids(tbl, 'tr');
+  const rows = unwrap(tbl, 'tr');
   if (!rows.length) return null;
   const grid = [];
   let n = -1;
   for (const tr of rows) {
     const trPr = kid(tr, 'trPr');
     if (trPr && (kid(trPr, 'gridBefore') || kid(trPr, 'gridAfter'))) return null;
-    const cells = [];
-    for (const c of tr.childNodes) {
-      if (c.nodeType !== 1) continue;
-      if (isW(c, 'tc')) cells.push(c);
-      else if (isW(c, 'sdt')) return null;
-    }
+    const cells = unwrap(tr, 'tc');
     if (!cells.length || (n >= 0 && cells.length !== n)) return null;
     n = cells.length;
     const row = [];
@@ -687,7 +693,8 @@ export class DocxProjection {
     const unit = (u) => { u.idx = units.length; units.push(u); return u; };
     const textUnit = (part, text, set, extra) => unit({ kind: 'text', part, atoms: [...text].map((ch) => ({ ch, edit: true })), set, ...extra });
     const unhandled = new Map(); // 标签名 -> 次数
-    const stray = (el) => { if (!NO_TEXT.has(el.localName) && (el.localName === 'altChunk' || hasText(el))) unhandled.set(el.nodeName, (unhandled.get(el.nodeName) || 0) + 1); };
+    const strays = new Set(), bump = (tag) => unhandled.set(tag, (unhandled.get(tag) || 0) + 1);
+    const stray = (el) => { if (!NO_TEXT.has(el.localName) && (el.localName === 'altChunk' || hasText(el))) { strays.add(el); bump(el.nodeName); } };
     const found = []; // 正文里发现的文本框 / 图表 / SmartArt，放到「其他文本」区
     const linkUnits = new Map();
     const relLink = (h, part) => {
@@ -782,11 +789,12 @@ export class DocxProjection {
     const md = new MD(marks.ambig);
     const mkPara = (p, part) => { const atoms = collect(p, part); return atoms.length ? unit({ kind: 'para', el: p, part, atoms }) : null; };
     const listPrefix = (lab, indent) => (lab ? (indent ? '  '.repeat(lab.ilvl) : '') + lab.text + ' ' : '');
+    // 段落 p 里的文本框（只取直属 p 的一层；文本框里再套的，等遍历到外框里的段落时再找）
     const scanTextboxes = (p, part) => {
       for (const tb of p.getElementsByTagNameNS(NS.WORD, 'txbxContent')) {
         if (inFallback(tb)) continue;
         let outer = true;
-        for (let n = tb.parentNode; n && n.nodeType === 1; n = n.parentNode) if (n.localName === 'txbxContent') { outer = false; break; }
+        for (let n = tb.parentNode; n && n !== p; n = n.parentNode) if (n.localName === 'txbxContent') { outer = false; break; }
         if (outer) found.push({ title: t.parts.textbox, container: tb, part });
       }
     };
@@ -824,11 +832,7 @@ export class DocxProjection {
           } else {
             const start = md.length;
             md.s(marks.specialBegin);
-            const inner = [];
-            for (const tr of kids(c, 'tr')) for (const tc of tr.childNodes) {
-              if (isW(tc, 'tc')) inner.push(tc);
-              else if (isW(tc, 'sdt')) inner.push(...kids(kid(tc, 'sdtContent'), 'tc'));
-            }
+            const inner = unwrap(c, 'tr').flatMap((tr) => unwrap(tr, 'tc'));
             const before = md.length;
             for (const tc of inner) walkCell(tc, part);
             if (md.length === before) md.cut(start);
@@ -847,7 +851,7 @@ export class DocxProjection {
           const lab = lists.label(c), para = mkPara(c, part);
           if (para) { emitPara(md, para, listPrefix(lab), true); md.s('\n'); }
         } else if (c.localName === 'tbl') {
-          for (const tr of kids(c, 'tr')) for (const t2 of kids(tr, 'tc')) walkCell(t2, part);
+          for (const tr of unwrap(c, 'tr')) for (const t2 of unwrap(tr, 'tc')) walkCell(t2, part);
         } else if (c.localName === 'sdt' || c.localName === 'customXml') { const sc = c.localName === 'sdt' ? kid(c, 'sdtContent') : c; if (sc) walkCell(sc, part); }
         else stray(c);
       }
@@ -899,8 +903,19 @@ export class DocxProjection {
     }
     for (const m of relsOf.values()) for (const r of m.values()) if (r.type === 'diagramDrawing' && !r.external) { const p = await load(r.path); if (p && !this.#mirrors.includes(p)) this.#mirrors.push(p); }
 
+    // 兜底：文本部件里没进投影的文字（不在任何段落原子里，也不在删除修订、Fallback、上面已报过的元素里），以及批注，都按标签报进 unhandled
+    const covered = new Set(), samples = new Map();
+    for (const u of units) if (u.kind === 'para') for (const a of u.atoms) covered.add(a.item);
+    const skip = (el) => { for (let n = el.parentNode; n && n.nodeType === 1; n = n.parentNode) if (strays.has(n) || n.localName === 'Fallback' || isW(n, 'del') || isW(n, 'moveFrom')) return true; return false; };
+    for (const part of this.#textParts) for (const [ns, tag] of [[NS.WORD, 'w:t'], [NS.A, 'a:t']]) for (const el of part.doc.getElementsByTagNameNS(ns, 't')) {
+      if (covered.has(el) || !el.textContent.trim() || skip(el)) continue;
+      bump(tag);
+      if (!samples.has(tag)) samples.set(tag, el.textContent.trim());
+    }
+    for (const p of ofType('comments')) for (const c of (await load(p))?.doc.getElementsByTagNameNS(NS.WORD, 'comment') || []) if (c.textContent.trim()) bump('w:comment');
+
     // 投影不到的内容：列出来提醒
-    this.unhandled = [...unhandled].map(([tag, count]) => ({ tag, count }));
+    this.unhandled = [...unhandled].map(([tag, count]) => (samples.has(tag) ? { tag, count, sample: samples.get(tag) } : { tag, count }));
     if (unhandled.size) warnings.push(t.warn.unhandled(this.unhandled.map((u) => ({ ...u, note: t.notes[u.tag.split(':').pop()] }))));
     const emb = Object.keys(zip.files).filter((p) => /^word\/embeddings\/[^/]+$/.test(p));
     if (emb.length) warnings.push(t.warn.embeddings(emb.length));

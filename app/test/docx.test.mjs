@@ -508,3 +508,42 @@ test('diffMd：同一张图片只改说明 = 改 alt；换成别的图片不会�
   assert.match(xml, /descr="某身份证"/);
   assert.equal((xml.match(/<w:drawing>/g) || []).length, 3, '图片本身没动');
 });
+
+// ---------- 漏投影 ----------
+const tc = (body) => `<w:tc>${p(body)}</w:tc>`;
+const wsp = (inner) => `<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><wp:docPr id="9" name="框"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:txbx><w:txbxContent>${inner}</w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice></mc:AlternateContent></w:r>`;
+
+test('表格里被内容控件 / customXml 包住的行和格也投影（普通表格与特殊表格）', async () => {
+  const sdtRow = `<w:sdt><w:sdtContent><w:tr>${tc(t('王五'))}${tc(t('13700001111'))}</w:tr></w:sdtContent></w:sdt>`;
+  const plain = `<w:tbl><w:tr>${tc(t('姓名'))}${tc(t('电话'))}</w:tr>${sdtRow}<w:customXml><w:tr>${tc(t('赵六'))}<w:sdt><w:sdtContent>${tc(t('13800002222'))}</w:sdtContent></w:sdt></w:tr></w:customXml></w:tbl>`;
+  const merged = `<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr>${p(t('合并'))}</w:tc></w:tr>${sdtRow}</w:tbl>`;
+  const d = await DocxProjection.load(await sample(plain + merged));
+  assert.match(d.md, /^\| 王五 \| 13700001111 \|$/m);
+  assert.match(d.md, /^\| 赵六 \| 13800002222 \|$/m);
+  assert.match(d.md, /^合并\n王五\n13700001111$/m);
+  d.mapPlain((s) => s.replaceAll('王五', '某'));
+  const xml = await docXml((await d.save({ type: 'uint8array' })).data);
+  assert.doesNotMatch(xml, /王五/);
+});
+
+test('文本框里套的文本框也投影，改动写回内层', async () => {
+  const d = await DocxProjection.load(await sample(p(t('正文') + wsp(p(t('外框') + wsp(p(t('内框张三'))))))));
+  assert.match(d.md, /^内框张三$/m);
+  assert.ok(!d.unhandled.some((u) => u.tag === 'w:t'));
+  d.mapPlain((s) => s.replace('内框张三', '内框某'));
+  const xml = await docXml((await d.save({ type: 'uint8array' })).data);
+  assert.match(xml, /内框<\/w:t><\/w:r><w:r><w:t[^>]*>某</);
+  assert.doesNotMatch(xml, /内框张三/);
+});
+
+test('兜底：投影之外的文字（如图形里的 a:t）和批注都报进 unhandled', async () => {
+  const shape = `<w:r><w:drawing><wp:inline><wp:docPr id="7" name="形状"/><a:graphic><a:graphicData uri="urn:x-unknown"><a:p><a:r><a:t>形状里的张三</a:t></a:r></a:p></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
+  const buf = await sample(p(t('有形状') + shape));
+  const z = await JSZip.loadAsync(buf);
+  z.file('word/comments.xml', `<w:comments ${W}><w:comment w:id="0" w:author="x"><w:p><w:r><w:t>批注里的张三</w:t></w:r></w:p></w:comment></w:comments>`);
+  z.file('word/_rels/document.xml.rels', (await z.file('word/_rels/document.xml.rels').async('string')).replace('</Relationships>', `<Relationship Id="rCm" Type="${REL}comments" Target="comments.xml"/></Relationships>`));
+  const d = await DocxProjection.load(await z.generateAsync({ type: 'uint8array' }));
+  assert.deepEqual(d.unhandled.filter((u) => u.tag !== 'w:drawing'), [{ tag: 'a:t', count: 1, sample: '形状里的张三' }, { tag: 'w:comment', count: 1 }]);
+  assert.match(d.warnings.join('\n'), /<a:t> ×1（没投影到的文字，如「形状里的张三」）/);
+  assert.match(d.warnings.join('\n'), /<w:comment> ×1（批注）/);
+});
