@@ -13,26 +13,35 @@ function findAll(md, text, add) {
   while (i >= 0) { add(i, i + text.length); i = md.indexOf(text, i + text.length); }
 }
 
-// 含姓名的表格：标签格的下一格 / 特殊表格中标签行的下一行
+// 含姓名的表格：标签格的下一格 / 特殊表格中标签行的下一行；命中即整个表格（普通表格的连续行 / 特殊表格 open~close）一起删
+// put(names, s, e, a, b)：names 命中的姓名，[s, e) 整个表格，a~b 起止行号
 function tableNames(lines, put) {
-  let label = false;
+  let label = false, blk = null;
   const strip = (s) => s.replace(/[：:\s]/g, '');
-  for (const { text: line, s: start, n: ln, kind } of lines) {
-    if (kind === 'open' || kind === 'close') { label = false; continue; }
-    if (kind === 'table') {
-      let p = start + 2, prevLabel = false;
-      for (const cell of line.slice(2, -2).split(' | ')) {
-        const t = strip(cell);
-        if (prevLabel && NAME_VALUE.test(t) && !NAME_STOP.test(t)) { const a = cell.search(/[^：:\s]/), z = cell.search(/[：:\s]*$/); put(t, p + a, p + z); } // 「张 三」：整段（含中间空白）都算命中，不能按 t 的长度截
-        prevLabel = NAME_LABELS.test(t);
-        p += cell.length + 3;
-      }
-    } else if (kind === 'cell') {
+  const flush = () => { if (blk?.names.length) put(blk.names.join('、'), blk.s, blk.e, blk.a, blk.b); blk = null; };
+  const extend = (l) => { blk ||= { s: l.s, a: l.n, names: [] }; blk.e = l.s + l.text.length; blk.b = l.n; };
+  for (const l of lines) {
+    const { text: line, kind } = l;
+    if (kind === 'open') { flush(); label = false; extend(l); continue; }
+    if (kind === 'close') { label = false; extend(l); flush(); continue; }
+    if (kind === 'cell') {
+      extend(l);
       const t = strip(line);
-      if (label && NAME_VALUE.test(t) && !NAME_STOP.test(t)) put(t, start, start + line.length, ln); // 特殊表格 1 格 1 行：按行号删，和章节一样
+      if (label && NAME_VALUE.test(t) && !NAME_STOP.test(t)) blk.names.push(t);
       label = NAME_LABELS.test(t);
-    }
+    } else if (kind === 'table' || kind === 'tableSep') {
+      extend(l);
+      if (kind === 'table') {
+        let prevLabel = false;
+        for (const cell of line.slice(2, -2).split(' | ')) {
+          const t = strip(cell);
+          if (prevLabel && NAME_VALUE.test(t) && !NAME_STOP.test(t)) blk.names.push(t);
+          prevLabel = NAME_LABELS.test(t);
+        }
+      }
+    } else flush();
   }
+  flush();
 }
 
 // 模型常见的无效碎片：只剩公司后缀（"限公司"、"技有限公司"）、括号不成对（"中国）有限公司"）
@@ -91,9 +100,7 @@ export function scan(md0, st0 = {}) {
   const abbr = new Set();
   for (const m of md.matchAll(ABBR_RE)) abbr.add(m[1]);
   for (const w of abbr) findAll(md, w, (s, e) => put('abbr:' + w, w, { cat: 'abbr', en: 'abbr', cls: 'abbr' }, s, e));
-  tableNames(view.lines, (t, s, e, ln) => (ln
-    ? put('tbl:' + lineRule.dump(ln), lineRule.dump(ln), { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true, del: true, show: t }, s, e)
-    : put('tbl:' + t, t, { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true }, s, e)));
+  tableNames(view.lines, (t, s, e, a, b) => put('tbl:' + lineRule.dump(a, b), lineRule.dump(a, b), { cat: 'tblname', en: 'tblname', cls: 'warn', warn: true, del: true, show: t }, s, e));
   // 模型只做兜底召回：规则 / 黑名单已识别的公司、地址里的碎片（"件有限公司"、"东华软"）不再重复列出
   const anchors = [...items.values()].filter((it) => it.cat === 'company' || it.cat === 'addr' || it.cat === 'black').map((it) => it.text);
   const cats = st.cats || {}, minScore = st.nerMin || 0, nerAll = st.ner.filter((n) => n.score >= minScore);

@@ -2,6 +2,19 @@
 
 离线运行的 Word 脱敏工具：把 `.docx` 投影成 Markdown，在上面按黑名单 / 规则 / 离线 NER 圈出敏感文字，再把改动写回 Word（直接替换，或写成审阅修订）。
 
+只依赖 Chrome，离线运行。先新建一个专用文件夹，只放 .docx 和 model_quantized.onnx，把文件夹拖进页面即可（刷新不丢）。工作结束整个文件夹可直接永久删除。
+
+右键点规则 / 专利号 → 在全文中定位。Ctrl+S 脱敏；Ctrl+Enter 后可在 WPS 打开审阅面板，逐条核对处理结果。
+
+工作原理： docx ⇄ md ⇄ txt，经 md/txt 做索引后原位回写，替换文字挂在旧文第一个被删字符的位置含原格式（纯文本/行内富文本）
+
+设计原理：只改docx文本区，用粗体/表格等特征分词，UI主要用于筛选 右栏分长短匹配 左栏分类计数。
+
+docx里点开才看的见的文本，也会被放进文本池脱敏。我负责的部分docx没试出问题。离线标注模型是 Xenova/bert-base-chinese-ner q8 做了点预处理调优，懂显卡的建议开WebGPU加速。标注做了缓存，我的部分刷了2万条缓存，没超
+
+事后调研到 Faker / Mimesis、PaddleNLP UIE/GLiNER、Label Studio，如果这方面要跟后续可以了解一下（假数据替换比“某公司”更适合训练集场景）
+
+
 ```
 cd app && npm i
 npm run dev        # 浏览器里用（需 Chromium：File System Access API）

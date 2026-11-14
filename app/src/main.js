@@ -78,7 +78,7 @@ const row = (x, scope) => {
     : scope === 'cats' && !TOOLS.some((t) => t.id === x.id) ? `<span class="n" data-n="${x.id}"></span>` : '';
   return `<label title="${esc(ruleCode(x.id))}"><input type="checkbox" data-s="${scope}" data-k="${x.id}" ${state[scope][x.id] ? 'checked' : ''}><span>${x.name}${tail}${x.note ? ` <span class="n">- ${x.note}</span>` : ''}</span></label>`;
 };
-const OPEN_ORDER = ['company', 'patent', 'cname', 'contact', 'ner_cand'];
+const OPEN_ORDER = ['company', 'ner_cand', 'abbr', 'cname', 'ner_date', 'ner_money', 'date'];
 function renderLeft() {
   const rest = EXTRA.filter((x) => !x.grp);
   $('catList').innerHTML = MAIN.filter((x) => !x.grp).map((x) => row(x, 'cats')).join('');
@@ -282,8 +282,10 @@ function updateCounts() {
   const cnt = {};
   for (const it of items.values()) cnt[it.en] = (cnt[it.en] || 0) + 1;
   cnt.img = doc.images.length;
+  totalOf = {}; // 左栏计数 = 该规则全部出现次数（不论是否被别类盖住）；剩余次数只在右键定位时显示
+  for (const it of items.values()) totalOf[it.en] = (totalOf[it.en] || 0) + it.occ.length;
   ruleOccs = {};
-  for (const x of [...MAIN, ...EXTRA]) if (x.grp || EXTRA.includes(x)) ruleOccs[x.id] = ruleOcc(x.id);
+  for (const x of [...MAIN, ...EXTRA]) if (x.id !== 'img' && x.id !== 'meta') ruleOccs[x.id] = ruleOcc(x.id); // img / meta 不是正文规则，计数另算
   for (const el of document.querySelectorAll('[data-n]')) if (!ruleOccs[el.dataset.n]) el.textContent = ` (${cnt[el.dataset.n] || 0})`;
   paintLoc();
 }
@@ -357,7 +359,7 @@ function locate(occ) { // 平滑滚动只在切换查找目标时用；同一目
   if (o) gotoOcc(o[0], o[1], smooth);
 }
 // 右键查找的目标：芯片面板 → 最近右键的那一项；「更多规则」→ 被右键过的规则。尾部显示 (剩N) / (回首)
-let ruleOccs = {};
+let ruleOccs = {}, totalOf = {};
 function ruleOcc(en) { // 更多规则在右栏已过滤的文本上运行：被其他类别已选中（将被打码）的位置不再计入
   const others = sel.filter((x) => x.it.en !== en), out = [];
   for (const it of items.values()) if (it.en === en) for (const o of it.occ) if (!others.some((x) => x.s < o[1] && o[0] < x.e)) out.push(o);
@@ -369,7 +371,7 @@ function paintLoc() {
   for (const b of document.querySelectorAll('[data-loc]')) { const it = items.get(b.dataset.loc); if (it) b.textContent = locLabel(it); }
   const cur = locT.kind === 'item' ? items.get(locT.id) : null;
   for (const el of document.querySelectorAll('[data-lp]')) el.textContent = cur && panelOf(cur) === el.dataset.lp ? tail(cur.occ) : '';
-  for (const x of [...MAIN, ...EXTRA]) { if (!ruleOccs[x.id]) continue; const el = document.querySelector(`[data-n="${x.id}"]`); if (el) el.textContent = ' ' + (isT('rule', x.id) ? tail(ruleOccs[x.id] || []) : `(${(ruleOccs[x.id] || []).length})`); }
+  for (const x of [...MAIN, ...EXTRA]) { if (!ruleOccs[x.id]) continue; const el = document.querySelector(`[data-n="${x.id}"]`); if (el) el.textContent = ' ' + (isT('rule', x.id) ? tail(ruleOccs[x.id] || []) : `(${totalOf[x.id] || 0})`); }
 }
 document.addEventListener('selectionchange', () => { cancelAnimationFrame(paintRaf); paintRaf = requestAnimationFrame(paintLoc); });
 const rightEl = document.querySelector('.right');
@@ -408,7 +410,7 @@ rightEl.addEventListener('contextmenu', (e) => { // 芯片没有定位按钮：�
   locate(it.occ); paintLoc();
 });
 
-for (const box of [$('extraList'), $('openList')]) box.addEventListener('contextmenu', (e) => {
+for (const box of [$('catList'), $('openList'), $('extraList')]) box.addEventListener('contextmenu', (e) => {
   const inp = e.target.closest('label')?.querySelector('input'); if (!inp) return;
   e.preventDefault();
   const en = inp.dataset.k;
@@ -604,13 +606,13 @@ async function loadManual(ent) {
     saved = new Set([...entries, ...synced]);
   } catch (e) { console.error(e); }
 }
-// 存档里没有的文字（识别出来的新条目）一律不勾选；用户已手动改过的不动。有变化返回真
+// 存档里有的文字勾选；存档里没有的新条目跟左栏开关走（等同对该类别触发一次 change），不再一律不勾选；用户已手动改过的不动。有变化返回真
 function restoreOn() {
   if (!saved) return false;
   let n = 0;
   for (const it of items.values()) {
     if (it.cat === 'black' || it.key in state.on) continue;
-    const on = saved.has(it.text);
+    const on = saved.has(it.text) || (enabled(it) && base(it));
     if (on !== isOn(it)) { state.on[it.key] = on; n++; }
   }
   return n > 0;

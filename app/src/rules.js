@@ -99,7 +99,7 @@ export const EXTRA = [
  { id: 'url', name: '网址' }, { id: 'birth', name: '出生日期' },
   { id: 'ner_verify', name: 'NER 窄化公司地址', nn: true }, { id: 'ner_alias', name: 'NER 人名放大（张总 / 小张）', nn: true },
   { id: 'ner_date', name: 'NER 日期补漏', nn: true, grp: 'open' }, { id: 'ner_money', name: 'NER 金额补漏', grp: 'open', nn: true },
-].map((x) => ({ def: false, ...x }));
+].map((x) => ({ def: x.id === 'url' || x.id.startsWith('ner_') ? false : true, ...x })); // 更多规则默认勾选，网址和 NER* 除外
 
 // 脱敏工具（勾选项与 di-app.png 一致）：scope=tools 为行为开关，scope=cats 为 NER 高亮
 export const TOOLS = [

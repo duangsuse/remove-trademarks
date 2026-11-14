@@ -148,11 +148,12 @@ test('审阅修订：写入后重新载入与原文一致，重复写入不叠�
   assert.equal((await allText(data2)).split(`w:author="${TOOL_AUTHOR}"`).length, xml.split(`w:author="${TOOL_AUTHOR}"`).length);
 });
 
-test('含姓名表格：姓名中间有空白时整段命中', () => {
-  const md = '| 姓名 | 张 三 |\n| 联系人： | 李　四： |';
-  const items = scan(md, st([]));
-  assert.deepEqual(items.get('tbl:张三').occ.map(([s, e]) => md.slice(s, e)), ['张 三']);
-  assert.deepEqual(items.get('tbl:李四').occ.map(([s, e]) => md.slice(s, e)), ['李　四']);
+test('含姓名表格：姓名中间有空白也能命中，命中即整个表格按行号删除', () => {
+  const md = '前文\n| 姓名 | 张 三 |\n| 联系人： | 李　四： |\n后文';
+  const it = scan(md, st([])).get('tbl:#L2~L3');
+  assert.ok(it.del);
+  assert.equal(it.show, '张三、李四');
+  assert.deepEqual(it.occ.map(([s, e]) => md.slice(s, e)), ['| 姓名 | 张 三 |\n| 联系人： | 李　四： |']);
 });
 
 test('nerLines：只清空表格分隔行，纯 ASCII 的表格行照常送 NER', () => {
@@ -271,7 +272,7 @@ test('特殊表格：<details>::: 开头、:::</details> 收尾；表格里的�
   assert.ok(a >= 0, d.md);
   assert.deepEqual(lines.slice(a, a + 5), [MARK.open + MARK.openNote, '基本信息', '联系人', '王五', MARK.close]);
   const items = scan(d.md, st([]));
-  assert.equal(items.get('tbl:#L' + (a + 4)).show, '王五');
+  assert.equal(items.get(`tbl:#L${a + 1}~L${a + 5}`).show, '王五'); // 整个 open~close 一起删
   assert.ok(!chapters(d.md).some((c) => /details|:::/.test(c.title)));
   const open = d.md.indexOf(MARK.open), close = d.md.indexOf(MARK.close);
   assert.equal(partnerOf(d.md, open + 3), close, '开头行 → 收尾行');
