@@ -196,7 +196,7 @@ function emitObj(md, para, i, o, locked) {
   md.sp('](' + o.path, para, i + 1);
   if (o.title) { md.sp(' "', para, i + 1); emitUnit(md, o.title); md.sp('"', para, i + 1); }
   md.sp(')', para, i + 1);
-  md.imgs.push({ s, e: md.length, pid: para.idx, off: i, path: o.path, part: para.part, locked: !!locked });
+  md.imgs.push({ s, e: md.length, pid: para.idx, off: i, path: o.path, file: o.file, part: para.part, locked: !!locked });
 }
 
 function emitPara(md, para, prefix = '', lineStart = false) {
@@ -484,6 +484,13 @@ function reviseLink(h, setNew, ctx) {
   h.parentNode.insertBefore(neu, h.nextSibling);
 }
 
+// 部件 from 里引用包内路径 to 的相对写法
+const relTarget = (from, to) => {
+  const a = from.split('/').slice(0, -1), b = to.split('/');
+  let i = 0;
+  while (i < a.length && i < b.length - 1 && a[i] === b[i]) i++;
+  return '../'.repeat(a.length - i) + b.slice(i).join('/');
+};
 const closestP = (n) => { for (; n && n.nodeType === 1; n = n.parentNode) if (isW(n, 'p')) return n; return null; };
 
 // 段落之间可以跳过的范围标记（书签、批注范围等）
@@ -642,7 +649,7 @@ function maxId(parts) {
 // ---------- 投影 ----------
 export class DocxProjection {
   md = '';
-  images = []; // 图片 / 图表 / SmartArt 在 md 里的整段 [{s, e, pid, off, path, part, locked}]
+  images = []; // 图片 / 图表 / SmartArt 在 md 里的整段 [{s, e, pid, off, path（md 里的写法）, file（包内路径，外链为 null）, part, locked}]
   warnings = [];
   unhandled = []; // 投影不了的元素 [{tag: 'm:oMath', count}]，也会汇总进 warnings
   #opts = null; // { marks, author, i18n }
@@ -654,7 +661,7 @@ export class DocxProjection {
   #stats = { del: 0, ins: 0, skipped: 0, fmt: 0 }; // 各次编辑累计，save 再按实际写入修正成 report
   #edits = new Edits();
   #mirrors = [];
-  #blank = [];
+  #swap = new Map(); // 媒体文件 -> 新内容
   #mainPath = '';
   #types = []; // 新加的部件要登记进 [Content_Types].xml 的 <Override>
   #wipe = false;
@@ -759,20 +766,29 @@ export class DocxProjection {
     return this.splice(plainToSpans(this.md, fn, range, this.#opts.marks));
   }
 
-  // 媒体文件 word/media/*：[{path, name, ext, size, bytes, mime, replaceable, uses: [{s, e}]}]；replaceable 表示 blankImages 能换成占位小图。须在 save 之前调用
+  // 媒体文件 word/media/*：[{path, name, ext, size, bytes, mime, replaceable, uses: [{s, e}]}]；replaceable 表示 blankImages 能换成占位小图，uses 是它在 md 里的各处。须在 save 之前调用
   async media() {
     const out = [], zip = this.#zip;
     for (const path of Object.keys(zip.files)) {
       const m = /^word\/media\/([^/]+)\.([A-Za-z0-9]+)$/.exec(path);
       if (!m || zip.files[path].dir) continue;
       const ext = m[2].toLowerCase(), bytes = await zip.file(path).async('uint8array'), mime = MIME[ext] || '';
-      const uses = this.images.filter((x) => 'word/' + x.path === path).map(({ s, e }) => ({ s, e }));
-      out.push({ path, name: m[1] + '.' + ext, ext, size: bytes.length, bytes, mime, replaceable: !!mime, uses });
+      const uses = this.images.filter((x) => x.file === path).map(({ s, e }) => ({ s, e }));
+      out.push({ path, name: m[1] + '.' + ext, ext, size: bytes.length, bytes, mime, replaceable: !!(mime && PLACEHOLDER[ext === 'jpeg' ? 'jpg' : ext]), uses });
     }
     return out.sort((a, b) => a.path.localeCompare(b.path, 'en', { numeric: true }));
   }
 
-  blankImages(paths) { this.#blank.push(...paths); return this; } // 换成 1×1 占位图
+  // 图片换成 bytes：非审阅模式直接换掉媒体文件（所有引用一起换）；审阅模式下正文里每处都是「原图删除 + 指向新媒体文件的副本插入」。
+  // list：[{ path: 'word/media/image1.png', bytes }]；返回正文里涉及的处数
+  replaceImages(list) {
+    for (const { path, bytes } of list) this.#swap.set(path, bytes);
+    return this.images.filter((x) => this.#swap.has(x.file)).length;
+  }
+  // 换成 1×1 占位图（svg / emf 等换不了的跳过）
+  blankImages(paths) {
+    return this.replaceImages(paths.flatMap((path) => { const ext = path.split('.').pop().toLowerCase(), b = PLACEHOLDER[ext === 'jpeg' ? 'jpg' : ext]; return b ? [{ path, bytes: b64(b) }] : []; }));
+  }
   wipeMetadata() { this.#wipe = true; return this; } // 抹掉作者、批注、修订记录、rsid 等不可见指纹
 
   // revisions：写成审阅修订（作者 author）；type 同 JSZip.generateAsync。DOM 会被改写，只能调用一次。
@@ -791,21 +807,32 @@ export class DocxProjection {
     const merges = [];
     const added = this.#pairImages(ctx);
     // 文本单元（链接地址、图片说明、图表文字…）：非审阅模式直接改；审阅模式下图片说明改成「删原图 + 插改了说明的副本」，其余等段落改完再处理
-    const reimg = new Map(); // 图片原子 -> [[单元, 新值]]
+    const reimg = new Map(); // 图片原子 -> [在副本上做的改动]
+    const onCopy = (a, fn) => { if (!reimg.has(a)) reimg.set(a, []); reimg.get(a).push(fn); };
     for (const [pid, ed] of this.#edits) {
       const u = this.#units[pid];
       if (u.kind !== 'text') continue;
       const v = textAfter(u, ed);
       if (!track) { u.set(v); if (u.mirror) mirror.set(u.orig, v); u.part.dirty = true; continue; }
       const a = u.attr && u.obj.atom;
-      if (a && !a.locked && !this.#edits.get(a.pid)?.drop.has(a.off)) { if (!reimg.has(a)) reimg.set(a, []); reimg.get(a).push([u, v]); }
+      if (a && !a.locked && !this.#edits.get(a.pid)?.drop.has(a.off)) onCopy(a, (r) => u.setOn(r, v));
       else later.push([u, v]);
     }
-    for (const [a, list] of reimg) {
+    if (track) for (const [path, bytes] of this.#swap) { // 换图：副本指向新媒体文件（每个部件各加一条关系）
+      const hits = this.images.filter((x) => x.file === path && !x.locked && !this.#edits.get(x.pid)?.drop.has(x.off));
+      if (!hits.length || !this.#zip.file(path)) continue;
+      const np = this.#newMedia(path, bytes), ids = new Map();
+      for (const x of hits) {
+        const a = this.#units[x.pid].atoms[x.off], [ns, tag, attr] = a.obj.ref;
+        if (!ids.has(x.part)) ids.set(x.part, this.#addRel(this.#parts.get(relsPathOf(x.part.path)), REL_TYPE + 'image', relTarget(x.part.path, np), false, x.part.path));
+        onCopy(a, (r) => own(r, ns, tag)?.setAttributeNS(NS.R, attr, ids.get(x.part)));
+      }
+    }
+    for (const [a, fns] of reimg) {
       const ped = this.#edits.of(a.pid), r = a.r.cloneNode(false), rpr = kid(a.r, 'rPr');
       if (rpr) r.appendChild(rpr.cloneNode(true));
       r.appendChild(a.item.cloneNode(true));
-      for (const [u, v] of list) u.setOn(r, v);
+      for (const fn of fns) fn(r);
       ctx.renew(r);
       ped.drop.add(a.off);
       ped.ins.set(a.off, OBJ + (ped.ins.get(a.off) || ''));
@@ -869,11 +896,7 @@ export class DocxProjection {
       if (wiped.has(part)) xml = xml.replace(FP_ATTR, '');
       this.#zip.file(part.path, /^<\?xml/.test(xml) ? xml : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + xml);
     }
-    for (const path of this.#blank) {
-      const ext = path.split('.').pop().toLowerCase();
-      const key = ext === 'jpeg' ? 'jpg' : ext;
-      if (PLACEHOLDER[key] && this.#zip.file(path)) this.#zip.file(path, b64(PLACEHOLDER[key]));
-    }
+    if (!track) for (const [path, bytes] of this.#swap) if (this.#zip.file(path)) this.#zip.file(path, bytes);
     if (this.#types.length) {
       const f = this.#zip.file('[Content_Types].xml');
       let x = (await f.async('string')).replace(/<Types([^>]*)\/>/, '<Types$1></Types>');
@@ -915,6 +938,16 @@ export class DocxProjection {
   }
 
   #count(st) { for (const k in st) this.#stats[k] += st[k]; return st; }
+
+  // 媒体文件 path 的新版本另存一份（名字加 _new），返回包内路径
+  #newMedia(path, bytes) {
+    let np = path.replace(/(\.[^./]+)?$/, '_new$1');
+    for (let n = 2; this.#zip.file(np); n++) np = path.replace(/(\.[^./]+)?$/, `_new${n}$1`);
+    this.#zip.file(np, bytes);
+    const mime = MIME[np.split('.').pop().toLowerCase()];
+    if (mime) this.#types.push([np, mime]);
+    return np;
+  }
 
   // 在关系部件 rels（{path, doc}，没有则按 owner 部件新建）里加一条关系，返回新 Id
   #addRel(rels, type, target, external = false, owner = this.#mainPath) {
@@ -1014,10 +1047,10 @@ export class DocxProjection {
     };
     const object = (d, part) => {
       const rel = (id) => (id ? relsOf.get(part.path)?.get(id) : null);
-      let label = '', target = null, embed = '';
+      let label = '', target = null, embed = '', ref = null; // ref：图片指向媒体的属性（换图时改在副本上）
       const blip = own(d, NS.A, 'blip'), vimg = own(d, NS.V, 'imagedata'), gd = own(d, NS.A, 'graphicData');
-      if (blip) target = rel(blip.getAttributeNS(NS.R, 'embed') || blip.getAttributeNS(NS.R, 'link'));
-      else if (vimg) target = rel(vimg.getAttributeNS(NS.R, 'id'));
+      if (blip) { ref = blip.getAttributeNS(NS.R, 'embed') ? [NS.A, 'blip', 'r:embed'] : [NS.A, 'blip', 'r:link']; target = rel(blip.getAttributeNS(NS.R, ref[2].slice(2))); }
+      else if (vimg) { ref = [NS.V, 'imagedata', 'r:id']; target = rel(vimg.getAttributeNS(NS.R, 'id')); }
       else if (gd) {
         const uri = gd.getAttribute('uri') || '';
         if (uri.endsWith('/chart')) { label = t.parts.chart; embed = 'chart'; target = rel(own(gd, NS.C, 'chart')?.getAttributeNS(NS.R, 'id')); }
@@ -1031,7 +1064,7 @@ export class DocxProjection {
         const setOn = (root, nv) => { const dp = own(root, NS.WP, 'docPr'), cn = own(root, NS.PIC, 'cNvPr'); if (cn && cn.getAttribute(name) === dp?.getAttribute(name)) cn.setAttribute(name, nv); dp?.setAttribute(name, nv); };
         return textUnit(part, v, (nv) => setOn(d, nv), { attr: name, setOn });
       };
-      const o = { label, path: target.external ? target.target : target.path.replace(/^word\//, ''), alt: attr('descr'), title: attr('title') };
+      const o = { label, path: target.external ? target.target : target.path.replace(/^word\//, ''), file: target.external ? null : target.path, ref, alt: attr('descr'), title: attr('title') };
       for (const u of [o.alt, o.title]) if (u) u.obj = o;
       if (embed && !target.external) found.push({ embed, path: target.path, obj: o });
       return o;

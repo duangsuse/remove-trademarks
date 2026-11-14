@@ -50,7 +50,8 @@ d.diffMd(newMd, { from })   // 整份 md：和原投影做 diff，转成 splice�
                             // from 是另一个 DocxProjection 时只取它的可编辑字
 d.mapPlain(fn, { range })   // 纯文本：fn(txt) => txt'，diff 转成 splice；range = [s, e]（md 坐标）时只把这一段交给 fn
 
-d.blankImages(paths)        // 换成 1×1 占位图
+d.replaceImages([{ path, bytes }]) // 换图（path 如 word/media/image1.png）；审阅模式下每处都是「原图删除 + 新图插入」
+d.blankImages(paths)        // 换成 1×1 占位图（即 replaceImages 占位图）
 d.wipeMetadata()            // 抹掉作者、批注、修订记录、rsid 等不可见指纹
 
 const { blob, report, warnings } = await d.save();                         // 浏览器

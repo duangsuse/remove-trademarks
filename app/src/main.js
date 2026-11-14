@@ -623,11 +623,16 @@ const reviewToA = () => guarded(async () => {
   const b = await DocxProjection.load(await fs.read(hB));
   const a = await DocxProjection.load(await fs.read(doc.cur.h)); // 现读 A：保留打开后在 Word 里做的修改，上次写入的修订载入时已撤掉
   const diff = a.diffMd(b.md, { from: b });
-  if (!diff.del && !diff.ins && !diff.fmt) return status(diff.skipped ? `${doc.cur.name} 与 ${hB.name} 有 ${diff.skipped} 处差异无法写成修订，未写入` : `${doc.cur.name} 与 ${hB.name} 的文字没有差异，未写入`);
+  // 图片：B 里内容变了的媒体文件（如图库换成的占位图），在 A 里写成「原图删除 + 新图插入」
+  const bm = new Map((await b.media()).map((x) => [x.path, x.bytes]));
+  const sameBytes = (x, y) => x.length === y.length && x.every((v, i) => v === y[i]);
+  const swapped = (await a.media()).filter((x) => bm.has(x.path) && !sameBytes(x.bytes, bm.get(x.path))).map((x) => ({ path: x.path, bytes: bm.get(x.path) }));
+  const imgs = a.replaceImages(swapped);
+  if (!diff.del && !diff.ins && !diff.fmt && !imgs) return status(diff.skipped ? `${doc.cur.name} 与 ${hB.name} 有 ${diff.skipped} 处差异无法写成修订，未写入` : `${doc.cur.name} 与 ${hB.name} 没有差异，未写入`);
   const { blob, report: stats, warnings } = await a.save({ revisions: true });
   await fs.write(doc.cur.h, blob);
   alertList(`已写入 ${doc.cur.name}，但有以下问题：`, warnings);
-  status(`已把 ${hB.name} 的差异写入 ${doc.cur.name}：${stats.del} 处删除 / ${stats.ins} 处插入` + (stats.fmt ? ` / ${stats.fmt} 处格式` : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · 请在 Word 审阅面板检查后保存');
+  status(`已把 ${hB.name} 的差异写入 ${doc.cur.name}：${stats.del} 处删除 / ${stats.ins} 处插入` + (stats.fmt ? ` / ${stats.fmt} 处格式` : '') + (imgs ? ` / ${imgs} 处图片` : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · 请在 Word 审阅面板检查后保存');
 });
 $('apply').onclick = applyAll;
 $('append').onclick = reviewToA;

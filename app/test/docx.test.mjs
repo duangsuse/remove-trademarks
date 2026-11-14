@@ -661,3 +661,44 @@ test('只改粗斜体：写成格式修订（rPrChange），重新载入撤回�
   assert.deepEqual(runs, ['一二', '三四']);
   assert.match(await docXml((await (async () => { const e = await DocxProjection.load(await mini(p(t('一二三四')))); e.diffMd(e.md.replace('三四', '*三四*')); return e.save({ type: 'uint8array' }); })()).data), /<w:i\/><\/w:rPr><w:t[^>]*>三四/);
 });
+
+// ---------- 图库换图 ----------
+test('blankImages：直接保存换掉媒体文件；审阅模式下是「原图删除 + 指向新文件的副本插入」，重新载入撤回', async () => {
+  const buf = await tabSample();
+  let d = await DocxProjection.load(buf);
+  assert.equal(d.blankImages(['word/media/image1.png']), 1);
+  let z = await JSZip.loadAsync((await d.save({ type: 'uint8array' })).data);
+  assert.equal((await z.file('word/media/image1.png').async('uint8array'))[1], 0x50, '换成了 PNG 占位图');
+  assert.equal((await z.file('word/document.xml').async('string')).match(/<w:drawing>/g).length, 3);
+
+  d = await DocxProjection.load(buf);
+  const orig = d.md;
+  d.blankImages(['word/media/image1.png']);
+  d.diffMd(d.md.replace(imgTok, imgTok.replace('张三', '某'))); // 同一张图再改说明：合进同一个副本
+  const { data } = await d.save({ type: 'uint8array', revisions: true });
+  z = await JSZip.loadAsync(data);
+  const xml = await z.file('word/document.xml').async('string');
+  assert.match(xml, /<w:ins [^>]*><w:r><w:drawing>(?:(?!<\/w:drawing>).)*descr="某身份证"(?:(?!<\/w:drawing>).)*r:embed="rIdDi1"/);
+  assert.match(xml, /<w:del [^>]*><w:r><w:drawing>(?:(?!<\/w:drawing>).)*descr="张三身份证"(?:(?!<\/w:drawing>).)*r:embed="rI"/);
+  assert.equal((xml.match(/<w:drawing>/g) || []).length, 4, '只多一个副本');
+  assert.match(await z.file('word/_rels/document.xml.rels').async('string'), /Id="rIdDi1" Type="[^"]*\/image" Target="media\/image1_new\.png"/);
+  assert.equal(await z.file('word/media/image1.png').async('string'), 'x', '原图文件不动（在删除线里）');
+  assert.ok(z.file('word/media/image1_new.png'));
+  assert.match(await z.file('[Content_Types].xml').async('string'), /PartName="\/word\/media\/image1_new\.png" ContentType="image\/png"/);
+  assert.equal((await DocxProjection.load(data)).md, orig);
+});
+
+test('审阅面板流程：B 的媒体文件内容变了，A.replaceImages 写成换图修订', async () => {
+  const buf = await tabSample();
+  const b = await DocxProjection.load(buf);
+  b.blankImages(['word/media/image1.png']);
+  const bp = await DocxProjection.load((await b.save({ type: 'uint8array' })).data);
+  const a = await DocxProjection.load(buf);
+  assert.deepEqual(a.diffMd(bp.md, { from: bp }), { del: 0, ins: 0, skipped: 0, fmt: 0 }, '文字没变');
+  const bm = new Map((await bp.media()).map((x) => [x.path, x.bytes]));
+  const changed = (await a.media()).filter((x) => bm.get(x.path).join() !== x.bytes.join()).map((x) => ({ path: x.path, bytes: bm.get(x.path) }));
+  assert.equal(a.replaceImages(changed), 1);
+  const xml = await docXml((await a.save({ type: 'uint8array', revisions: true })).data);
+  assert.match(xml, /<w:del [^>]*><w:r><w:drawing>/);
+  assert.match(xml, /<w:ins [^>]*><w:r><w:drawing>/);
+});
