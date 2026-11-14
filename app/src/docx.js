@@ -36,6 +36,8 @@ export const I18N = {
     newImages: (n) => `${n} 处新增图片被忽略（图片只能删除、移动或复制文档里已有的：路径须与原图相同，且在同一部分——正文 / 页眉等不能互相搬）`,
     untracked: (n) => `${n} 处链接地址 / 图片说明 / 图表文字无法写成修订，未改动`,
     failed: (n) => `${n} 段写入失败（详见控制台），这些段落保持原样`,
+    unmerged: (n) => `${n} 处段落合并没写入（后面不是段落，或会删掉分节符）`,
+    foreign: (n) => `${n} 处插入落在别人的修订里，没写入`,
     smartArt: (n) => `SmartArt 缓存里有 ${n} 处文字没对上，可能还残留原文（在 Word 里点一下该 SmartArt 会重新排版）`,
     savedTwice: 'DocxProjection.save() 只能调用一次',
   },
@@ -163,13 +165,15 @@ function runFmt(r, style) {
 
 // ---------- Markdown 构建 ----------
 // 每个 md 字符记：pid 所属单元、off 单元内原子位置、ed 可编辑、aft「紧跟这个字之后插入」落在单元内哪个位置
-// （可编辑字是 off + 1；不可编辑的原子如 <br> 也是 off + 1；它前面的标记、转义是 off，即插在原子之前）
+// （可编辑字是 off + 1；不可编辑的原子如 <br> 也是 off + 1；它前面的标记、转义是 off，即插在原子之前）；
+// brk：段落之间的换行代表哪个段落的段落标记（删掉它 = 与下一段合并），其余为 -1
 class MD {
-  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; this.aft = []; this.imgs = []; }
-  push(str, pid, off, ed, aft = off + ed) { for (let i = 0; i < str.length; i++) { this.out.push(str[i]); this.pid.push(pid); this.off.push(off); this.ed.push(ed); this.aft.push(aft); } }
+  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; this.aft = []; this.brk = []; this.imgs = []; }
+  push(str, pid, off, ed, aft = off + ed, brk = -1) { for (let i = 0; i < str.length; i++) { this.out.push(str[i]); this.pid.push(pid); this.off.push(off); this.ed.push(ed); this.aft.push(aft); this.brk.push(brk); } }
   s(str) { this.push(str, -1, 0, 0); }
   sp(str, para, off, aft = off) { this.push(str, para.idx, off, 0, aft); }
-  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = this.aft.length = n; this.imgs = this.imgs.filter((x) => x.e <= n); }
+  mark(str, para) { this.push(str, -1, 0, 0, 0, para.idx); } // 段落标记
+  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = this.aft.length = this.brk.length = n; this.imgs = this.imgs.filter((x) => x.e <= n); }
   get length() { return this.out.length; }
 }
 const marker = (f) => (f === 'bi' ? '***' : f === 'b' ? '**' : '*');
@@ -195,7 +199,7 @@ function emitObj(md, para, i, o, locked) {
 
 function emitPara(md, para, prefix = '', lineStart = false) {
   const { atoms } = para;
-  md.s(prefix);
+  if (prefix) md.sp(prefix, para, 0); // 标题 # / 编号前缀：结构字符，但行首插入能挂到本段开头
   if (lineStart && !prefix && !atoms[0].link && md.ambig.test(head(atoms))) md.sp('\\', para, 0);
   // 空白 / 制表 / 换行不单独成粗斜体段：沿用前一个（开头则取后一个）非空白的格式
   const eff = atoms.map((a) => (/^\s$/.test(a.ch) ? null : a.fmt));
@@ -275,6 +279,19 @@ function rejectOurs(doc, author) {
     while (x.firstChild) x.parentNode.insertBefore(x.firstChild, x);
     x.remove(); n++;
   }
+  // 段落标记：自己删的去掉删除标记；自己插入的（拆段 / 新段）与下一段合并回去，用下一段的段落属性（拆段时原来的标记留在后一段）
+  const marks = (t) => byTag(t).filter((x) => x.parentNode?.localName === 'rPr' && x.parentNode.parentNode?.localName === 'pPr');
+  for (const x of marks('del')) { x.remove(); n++; }
+  for (const x of marks('ins').reverse()) {
+    const p = x.parentNode.parentNode.parentNode, np = nextBlock(p);
+    x.remove(); n++;
+    if (!isW(p, 'p') || !np || !isW(np, 'p')) continue;
+    kid(p, 'pPr')?.remove();
+    const npPr = kid(np, 'pPr');
+    if (npPr) p.insertBefore(npPr, p.firstChild);
+    for (const c of [...np.childNodes]) p.appendChild(c);
+    np.remove();
+  }
   return n;
 }
 
@@ -297,6 +314,7 @@ const hasText = (el) => [...el.childNodes].some((c) => (c.nodeType === 3 ? c.dat
 // ---------- 编辑记录 ----------
 // 插入文本里的 ![..](路径)：不是新增图片，而是移动（放回被删掉的同路径图片）或复制（克隆文档里已有的同路径图片）。文本里换成 OBJ，路径按顺序记进 refs，保存时再配对
 const OBJ = '\uFFFC';
+const PS = '\u2029'; // 插入文字里的分段（splice 把 \n 换成它，\u2028 换回 \n 即软换行）
 const IMG_TOKEN = /!\[(?:\\[\s\S]|[^\]\\])*\]\(([^\s)"]+)(?: "(?:\\[\s\S]|[^"\\])*")?\)/g;
 // diffMd 逐段比较时整张图片算一个词（不和别的图片逐字错配）；同一路径的才逐字比（改说明）
 const imgTokens = (s) => { const out = []; let p = 0; for (const m of s.matchAll(IMG_TOKEN)) { out.push(...s.slice(p, m.index), m[0]); p = m.index + m[0].length; } out.push(...s.slice(p)); return out; };
@@ -304,7 +322,7 @@ const imgPath = (tok) => (tok.length > 1 && tok.startsWith('![') ? new RegExp(IM
 const IMG_DIFF = { tokens: imgTokens, same: (x, y) => imgPath(x) != null && imgPath(x) === imgPath(y) };
 class Edits extends Map {
   dropped = []; // 被整体删除的图片 { pid, off, path, part }，没被配对到插入处的就是真删除
-  of(pid) { let e = this.get(pid); if (!e) this.set(pid, (e = { del: new Set(), ins: new Map(), drop: new Set(), refs: new Map(), nodes: new Map() })); return e; }
+  of(pid) { let e = this.get(pid); if (!e) this.set(pid, (e = { del: new Set(), ins: new Map(), drop: new Set(), refs: new Map(), nodes: new Map(), merge: false })); return e; }
   del(pid, off) { this.of(pid).del.add(off); }
   ins(pid, at, text) {
     const e = this.of(pid), refs = e.refs.get(at) || [];
@@ -312,6 +330,7 @@ class Edits extends Map {
     if (refs.length) e.refs.set(at, refs);
     e.ins.set(at, (e.ins.get(at) || '') + text);
   }
+  merge(pid) { this.of(pid).merge = true; } // 删掉段落标记：与下一段合并
   dropObj(img) { const e = this.of(img.pid); if (!e.drop.has(img.off)) { e.drop.add(img.off); this.dropped.push(img); } }
 }
 // md 区间 [a, b) 整个包住的图片（只包住一半的不算：结构字符不可编辑）
@@ -325,17 +344,17 @@ function insertAnchor(map, p) {
 }
 
 // diffMd 插入的文字只取新 md 里的「内容」：来自另一个投影时取它的可编辑字符和整张图片（图片是移动 / 复制），
-// 否则按纯文本投影去掉转义与粗斜体标记、<br> 换回换行（md 的换行是分段，不算内容）。返回 (at, n) -> 新 md [at, at + n) 里的内容
+// 否则按纯文本投影去掉转义与粗斜体标记。返回 (at, n) -> 新 md [at, at + n) 里的内容，写法同 splice 的 text：\n 分段、\u2028 软换行
 function contentOf(newMd, from) {
   const keep = new Array(newMd.length).fill('');
   if (from) {
-    for (let i = 0; i < newMd.length; i++) if (from.ed[i]) keep[i] = newMd[i];
+    for (let i = 0; i < newMd.length; i++) if (from.ed[i] || from.brk[i] >= 0) keep[i] = newMd[i];
     for (const x of from.images) for (let i = x.s; i < x.e; i++) keep[i] = newMd[i];
   } else {
     const v = plainView(newMd);
     for (let k = 0; k < v.text.length; k++) {
       const [ms, me] = v.toMd(k, k + 1), c = v.text[k];
-      if (c === BR) keep[ms] = '\n'; else if (c !== '\n') keep[me - 1] = c; // md 的换行是分段（结构），<br> 才是软换行
+      keep[c === BR ? ms : me - 1] = c;
     }
   }
   return (at, n) => keep.slice(at, at + n).join('').replace(/\r\n?/g, '\n');
@@ -354,7 +373,69 @@ function mkText(doc, name, text) {
   return t;
 }
 
-// 返回因落在别人修订里而丢掉的插入数
+// 段落标记的格式（空段落里插字时用）：pPr > rPr 去掉其中的修订标记
+function markRPr(p) {
+  const r = kid(kid(p, 'pPr'), 'rPr')?.cloneNode(true);
+  if (!r) return null;
+  for (const c of [...r.childNodes]) if (c.nodeType === 1 && ['ins', 'del', 'moveFrom', 'moveTo', 'rPrChange'].includes(c.localName)) c.remove();
+  return r.childNodes.length ? r : null;
+}
+
+// 段落标记的修订：pPr > rPr 里的 w:ins / w:del（排在 rPr 最前；rPr 排在 pPr 的 sectPr / pPrChange 之前）
+function markPara(p, kind, ctx) {
+  const doc = p.ownerDocument;
+  let pPr = kid(p, 'pPr');
+  if (!pPr) { pPr = mkEl(doc, 'pPr'); p.insertBefore(pPr, p.firstChild); }
+  let rPr = kid(pPr, 'rPr');
+  if (!rPr) { rPr = mkEl(doc, 'rPr'); pPr.insertBefore(rPr, kid(pPr, 'sectPr') || kid(pPr, 'pPrChange') || null); }
+  const ins = kid(rPr, 'ins');
+  rPr.insertBefore(mkEl(doc, kind, { id: String(ctx.nextId++), author: ctx.author, date: ctx.date }), kind === 'del' && ins ? ins.nextSibling : rPr.firstChild);
+}
+
+// 在 marker 处把段落 p 拆成两段，返回后一段。后一段沿用原来的段落标记（含分节符）；前一段的标记是新插入的（审阅模式下标成插入）。
+// marker 可以在超链接等容器里：沿途的容器各拆成两份
+const SPLIT_NS = 'urn:x-docx-projection:split';
+function splitPara(p, marker, ctx) {
+  const np = p.cloneNode(false);
+  for (const a of [...np.attributes]) if (a.localName === 'paraId' || a.localName === 'textId') np.removeAttributeNode(a);
+  const pPr = kid(p, 'pPr');
+  if (pPr) np.appendChild(pPr.cloneNode(true));
+  let cur = marker, right = null;
+  while (cur.parentNode !== p) {
+    const parent = cur.parentNode, clone = parent.cloneNode(false);
+    while (cur.nextSibling) clone.appendChild(cur.nextSibling);
+    if (right) clone.insertBefore(right, clone.firstChild);
+    right = clone.firstChild ? clone : null;
+    cur = parent;
+  }
+  if (right) np.appendChild(right);
+  while (cur.nextSibling) np.appendChild(cur.nextSibling);
+  marker.remove();
+  kid(pPr, 'sectPr')?.remove();
+  if (ctx.track) markPara(p, 'ins', ctx);
+  p.parentNode.insertBefore(np, p.nextSibling);
+  ctx.created?.push(np);
+  return np;
+}
+
+// 段落之间可以跳过的范围标记（书签、批注范围等）
+const RANGE_MARKS = new Set(['bookmarkStart', 'bookmarkEnd', 'commentRangeStart', 'commentRangeEnd', 'permStart', 'permEnd', 'proofErr', 'moveFromRangeStart', 'moveFromRangeEnd', 'moveToRangeStart', 'moveToRangeEnd']);
+const nextBlock = (n) => { for (n = n.nextSibling; n; n = n.nextSibling) if (n.nodeType === 1 && !(n.namespaceURI === NS.WORD && RANGE_MARKS.has(n.localName))) return n; return null; };
+
+// 删掉段落 el 的段落标记：与后面第一个有内容的段落合并（中间空段落的标记一并删）。合并后的段落用后一段的格式（Word 也是这样）。
+// 后面不是段落（表格、正文结尾）或要删掉分节符时不合并，返回 false
+function mergeMark(el, ctx) {
+  const chain = [el];
+  let n = nextBlock(el);
+  while (n && isW(n, 'p') && !n.getElementsByTagNameNS(NS.WORD, 'r').length) { chain.push(n); n = nextBlock(n); }
+  if (!n || !isW(n, 'p') || chain.some((p) => kid(kid(p, 'pPr'), 'sectPr'))) return false;
+  if (ctx.track) { for (const p of chain) markPara(p, 'del', ctx); return true; }
+  const pPr = kid(n, 'pPr'), at = pPr ? pPr.nextSibling : n.firstChild;
+  for (const p of chain) { for (const c of [...p.childNodes]) if (!isW(c, 'pPr')) n.insertBefore(c, at); p.remove(); }
+  return true;
+}
+
+// 返回 { dropped：因落在别人修订里而丢掉的插入数, frags：拆段后的各段（第一段是原段落） }
 function applyParaEdits(para, ed, ctx) {
   const { atoms } = para;
   const doc = para.el.ownerDocument;
@@ -362,11 +443,11 @@ function applyParaEdits(para, ed, ctx) {
   const lastIdx = atoms.length - 1;
   for (const i of ed.del) if (atoms[i]?.edit) need.add(atoms[i].r);
   for (const i of ed.drop) need.add(atoms[i].r);
-  for (const at of ed.ins.keys()) need.add(atoms[Math.min(at, lastIdx)].r);
+  if (lastIdx >= 0) for (const at of ed.ins.keys()) need.add(atoms[Math.min(at, lastIdx)].r);
   const rprClones = new Map();
   for (const a of atoms) if (!rprClones.has(a.r)) rprClones.set(a.r, kid(a.r, 'rPr')?.cloneNode(true) || null);
-  // 插入文字的格式：替换（该位置的字被删）取被删字的格式，否则取前一个字的
-  const rprOfAtom = (gi) => rprClones.get(atoms[ed.del.has(gi) && atoms[gi]?.edit ? gi : Math.max(0, Math.min(gi - 1, lastIdx))].r);
+  // 插入文字的格式：替换（该位置的字被删）取被删字的格式，否则取前一个字的；空段落取段落标记的
+  const rprOfAtom = (gi) => (lastIdx < 0 ? markRPr(para.el) : rprClones.get(atoms[ed.del.has(gi) && atoms[gi]?.edit ? gi : Math.max(0, Math.min(gi - 1, lastIdx))].r));
   const meta = () => ({ id: String(ctx.nextId++), author: ctx.author, date: ctx.date });
   const mkRun = (r, rpr, child) => {
     const nr = r.cloneNode(false);
@@ -374,19 +455,25 @@ function applyParaEdits(para, ed, ctx) {
     nr.appendChild(child);
     return nr;
   };
-  // 插入文本里的 \n 写成 <w:br/>、\t 写成 <w:tab/>（点即换行 / 制表）；OBJ 处放回被移动的图片（ed.nodes，已在 save 里配好对）
+  // 插入文本里的 \n 写成 <w:br/>、\t 写成 <w:tab/>；OBJ 处放回被移动的图片（ed.nodes，已在 save 里配好对）；
+  // PS 处放一个拆段标记，整段改完后再在那里拆开（标记不进 w:ins）
   const insNode = (r, gi, text) => {
-    const runs = [], objs = [...(ed.nodes.get(gi) || [])];
-    for (const part of text.split(/([\n\t\uFFFC])/)) {
-      if (part === '\n') runs.push(mkRun(r, rprOfAtom(gi), mkEl(doc, 'br')));
+    const out = [], objs = [...(ed.nodes.get(gi) || [])];
+    let runs = [];
+    const wrap = () => {
+      if (!runs.length) return;
+      if (ctx.track) { const w = mkEl(doc, 'ins', meta()); runs.forEach((x) => w.appendChild(x)); out.push(w); } else out.push(...runs);
+      runs = [];
+    };
+    for (const part of text.split(/([\n\t\uFFFC\u2029])/)) {
+      if (part === PS) { wrap(); out.push(doc.createElementNS(SPLIT_NS, 'split')); }
+      else if (part === '\n') runs.push(mkRun(r, rprOfAtom(gi), mkEl(doc, 'br')));
       else if (part === '\t') runs.push(mkRun(r, rprOfAtom(gi), mkEl(doc, 'tab')));
       else if (part === OBJ) { const n = objs.shift(); if (n) runs.push(n); }
       else if (part) runs.push(mkRun(r, rprOfAtom(gi), mkText(doc, 't', part)));
     }
-    if (!ctx.track) return runs;
-    const w = mkEl(doc, 'ins', meta());
-    runs.forEach((x) => w.appendChild(x));
-    return w;
+    wrap();
+    return out;
   };
   const delNode = (r, rpr, text) => {
     if (!ctx.track) return null;
@@ -395,6 +482,7 @@ function applyParaEdits(para, ed, ctx) {
     return w;
   };
   let dropped = 0;
+  if (lastIdx < 0 && ed.ins.has(0)) for (const n of insNode(mkEl(doc, 'r'), 0, ed.ins.get(0))) para.el.appendChild(n); // 空段落（空单元格）
   for (const r of need) {
     const parent = r.parentNode;
     if (!parent || isW(parent, 'ins')) { for (const at of ed.ins.keys()) if (atoms[Math.min(at, lastIdx)].r === r) dropped++; continue; }
@@ -434,13 +522,15 @@ function applyParaEdits(para, ed, ctx) {
     for (const n of out) parent.insertBefore(n, r);
     parent.removeChild(r);
   }
-  return dropped;
+  const frags = [para.el];
+  for (const m of [...para.el.getElementsByTagNameNS(SPLIT_NS, 'split')]) frags.push(splitPara(frags.at(-1), m, ctx));
+  return { dropped, frags };
 }
 
 function applyTextEdits(u, ed) {
   let s = '';
   u.atoms.forEach((a, i) => { s += ed.ins.get(i) ?? ''; if (!ed.del.has(i)) s += a.ch; });
-  s = (s + (ed.ins.get(u.atoms.length) ?? '')).replace(/\n/g, ' ').replace(/\uFFFC/g, ''); // 属性文字里放不了图片
+  s = (s + (ed.ins.get(u.atoms.length) ?? '')).replace(/[\n\u2029]/g, ' ').replace(/\uFFFC/g, ''); // 属性文字里放不了图片、不能分段
   u.set(s);
   return s;
 }
@@ -522,25 +612,51 @@ export class DocxProjection {
 
   // 三种编辑最终都走这里，返回本次的 {del, ins, skipped}。坐标都基于载入时的投影：多次调用在原文上叠加，后一次看不到前一次的结果
 
-  // 按 md 区间替换 [{s, e, text}]：区间内可编辑字符全删，text 插在第一个被删的字处、用它的格式；s === e 为纯插入
+  // 按 md 区间替换 [{s, e, text}]：区间内可编辑字符全删，text 插在第一个被删的字处、用它的格式；s === e 为纯插入。
+  // text 按纯文本写：\n 分段（连着几个算一个），\u2028 软换行，\t 制表。区间里段落之间的换行被删 = 与下一段合并
   splice(spans) {
-    const map = this.#map, { pid, off, ed } = map, st = { del: 0, ins: 0, skipped: 0 };
-    for (const { s, e, text = '' } of spans) {
+    const map = this.#map, { pid, off, ed, brk } = map, st = { del: 0, ins: 0, skipped: 0 };
+    for (const { s, e, text: raw = '' } of spans) {
       let first = -1;
       const gone = coveredImgs(this.images, s, e);
       for (const x of gone) this.#edits.dropObj(x);
       for (let i = s; i < e; i++) if (ed[i] && !gone.some((x) => i >= x.s && i < x.e)) { if (first < 0) first = i; this.#edits.del(pid[i], off[i]); }
-      if (first >= 0 || gone.length) st.del++; else if (e > s) st.skipped++; // 只有结构字符：删不掉
+      const merged = this.#mergesIn(s, e);
+      for (const p of merged) this.#edits.merge(p);
+      if (first >= 0 || gone.length || merged.length) st.del++; else if (e > s) st.skipped++; // 只有结构字符：删不掉
+      let text = raw.replace(/\r\n?/g, '\n').replace(/\n+/g, PS).replaceAll(BR, '\n');
       if (!text) continue;
-      const at = first >= 0 ? [pid[first], off[first]] : insertAnchor(map, s);
+      let at = first >= 0 ? [pid[first], off[first]] : insertAnchor(map, s);
+      if (!at && s > 0 && brk[s - 1] >= 0) { // 两段之间、后面没有可挂的段落（如正文末尾）：接在上一段末尾另起一段
+        at = [brk[s - 1], this.#units[brk[s - 1]].atoms.length];
+        text = PS + text.replace(/\u2029+$/, '');
+      }
       if (at) { this.#edits.ins(at[0], at[1], text); st.ins++; } else st.skipped++;
     }
     return this.#count(st);
   }
 
+  // 区间 [s, e) 里被删的段落标记 -> 要与下一段合并的段落。删的是「上一段的标记 + 下一段 Q 的全部文字」（如 \n\nQ）时改成删 Q 自己的标记：
+  // 段落格式存在段落标记里，这样上一段保持原样，Q 整段消失
+  #mergesIn(s, e) {
+    const { pid, ed, brk } = this.#map, out = [];
+    for (let i = s; i < e; i++) {
+      const P = brk[i];
+      if (P < 0 || out.includes(P) || out.includes(-P - 1)) continue;
+      let k = i;
+      while (k < brk.length && (brk[k] === P || (pid[k] < 0 && brk[k] < 0))) k++;
+      const Q = pid[k] ?? -1;
+      let q = k, any = false, all = true;
+      for (; q < brk.length && brk[q] < 0; q++) if (ed[q]) { any = true; if (q >= e) all = false; }
+      const swap = Q >= 0 && brk[q] === Q && q >= e && any && all;
+      out.push(swap ? Q : P);
+    }
+    return out;
+  }
+
   // 拿改过的整份 md 做 diff，差异作为区间替换交给 splice。from：新 md 来自另一个 DocxProjection 时传入，只取它的可编辑字符（和整张图片）
   diffMd(newMd, { from = null } = {}) {
-    const content = contentOf(newMd, from && { ed: from.#map.ed, images: from.images });
+    const content = contentOf(newMd, from && { ed: from.#map.ed, brk: from.#map.brk, images: from.images });
     const spans = [], st = { del: 0, ins: 0, skipped: 0 };
     for (const x of diffSpans(this.md, newMd, IMG_DIFF)) {
       const text = content(x.at, x.text.length);
@@ -582,7 +698,8 @@ export class DocxProjection {
     const warnings = [...this.warnings], stats = { ...this.#stats }, t = this.#opts.i18n, track = revisions;
     const ctx = { author, date: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), nextId: maxId(this.#textParts) + 1, track };
     const edited = [], mirror = new Map();
-    let untracked = 0, failed = 0;
+    let untracked = 0, failed = 0, foreign = 0;
+    const merges = [];
     const added = this.#pairImages(ctx);
     for (const [pid, ed] of this.#edits) {
       const u = this.#units[pid];
@@ -594,15 +711,22 @@ export class DocxProjection {
         continue;
       }
       const backup = u.el.cloneNode(true);
+      ctx.created = [];
       try {
-        const n = applyParaEdits(u, ed, ctx);
-        stats.ins = Math.max(0, stats.ins - n); stats.skipped += n;
-        edited.push(u.el); u.part.dirty = true;
+        const { dropped, frags } = applyParaEdits(u, ed, ctx);
+        stats.ins = Math.max(0, stats.ins - dropped); stats.skipped += dropped; foreign += dropped;
+        edited.push(...frags); u.part.dirty = true;
+        if (ed.merge) merges.push([pid, frags.at(-1)]);
       } catch (e) {
         console.error(e); failed++;
+        for (const x of ctx.created) x.remove();
         u.el.replaceWith(backup); // 半途失败的段落整段还原
       }
     }
+    let unmerged = 0;
+    for (const [, el] of merges.sort((a, b) => a[0] - b[0])) if (!mergeMark(el, ctx)) unmerged++; // 按文档顺序合并
+    if (unmerged) { warnings.push(t.warn.unmerged(unmerged)); stats.skipped += unmerged; }
+    if (foreign) warnings.push(t.warn.foreign(foreign));
     if (added) { warnings.push(t.warn.newImages(added)); stats.ins = Math.max(0, stats.ins - added); stats.skipped += added; }
     if (untracked) warnings.push(t.warn.untracked(untracked));
     if (failed) { warnings.push(t.warn.failed(failed)); stats.skipped += failed; }
@@ -738,7 +862,7 @@ export class DocxProjection {
         for (const c of r.childNodes) {
           if (c.nodeType !== 1) continue;
           const base = { r, item: c, fmt, locked, link: cur() };
-          const obj = (d) => { const o = d && object(d, part); if (o) atoms.push({ ...base, ch: '￼', obj: o, edit: false }); };
+          const obj = (d) => { const o = d && object(d, part); if (o) atoms.push({ ...base, ch: '\uFFFC', obj: o, edit: false }); };
           if (c.namespaceURI === NS.MC && c.localName === 'AlternateContent') {
             const ch = [...c.childNodes].find((x) => x.localName === 'Choice');
             obj(ch && [...ch.childNodes].find((x) => isW(x, 'drawing')));
@@ -809,7 +933,7 @@ export class DocxProjection {
           if (!para) continue;
           const h = headingLevel(c, style);
           emitPara(md, para, h ? '#'.repeat(h) + ' ' + listPrefix(lab) : listPrefix(lab, true), true);
-          md.s('\n\n');
+          md.mark('\n\n', para);
         } else if (c.localName === 'sdt') {
           const sc = kid(c, 'sdtContent');
           if (sc) walkBlocks(sc, part);
@@ -818,12 +942,12 @@ export class DocxProjection {
           const grid = plainTable(c);
           if (grid) {
             grid.forEach((row, ri) => {
-              md.s('| ');
               row.forEach((p, ci) => {
                 scanTextboxes(p, part);
                 const lab = lists.label(p), para = mkPara(p, part);
-                if (ci) md.s(' | ');
-                if (para) emitPara(md, para, listPrefix(lab));
+                md.s(ci ? ' |' : '|');
+                if (para) { md.s(' '); emitPara(md, para, listPrefix(lab)); }
+                else md.push(' ', unit({ kind: 'para', el: p, part, atoms: [] }).idx, 0, 0, 0); // 空单元格：竖线后的空格挂着它，在这里输入能写进去
               });
               md.s(' |\n');
               if (ri === 0) md.s('|' + ' --- |'.repeat(row.length) + '\n');
@@ -849,7 +973,7 @@ export class DocxProjection {
         if (c.localName === 'p') {
           scanTextboxes(c, part);
           const lab = lists.label(c), para = mkPara(c, part);
-          if (para) { emitPara(md, para, listPrefix(lab), true); md.s('\n'); }
+          if (para) { emitPara(md, para, listPrefix(lab), true); md.mark('\n', para); }
         } else if (c.localName === 'tbl') {
           for (const tr of unwrap(c, 'tr')) for (const t2 of unwrap(tr, 'tc')) walkCell(t2, part);
         } else if (c.localName === 'sdt' || c.localName === 'customXml') { const sc = c.localName === 'sdt' ? kid(c, 'sdtContent') : c; if (sc) walkCell(sc, part); }
@@ -924,7 +1048,7 @@ export class DocxProjection {
 
     this.images = md.imgs;
     this.md = md.out.join('');
-    this.#map = { pid: Int32Array.from(md.pid), off: Int32Array.from(md.off), ed: Uint8Array.from(md.ed), aft: Int32Array.from(md.aft) };
+    this.#map = { pid: Int32Array.from(md.pid), off: Int32Array.from(md.off), ed: Uint8Array.from(md.ed), aft: Int32Array.from(md.aft), brk: Int32Array.from(md.brk) };
   }
 }
 

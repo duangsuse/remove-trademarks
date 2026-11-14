@@ -85,14 +85,19 @@ export function diffSpans(a, b, { tokens = null, same = () => false } = {}) {
       else { pos += v.length; bp += v.length; }
     }
   }
+  // 按行比出改动块再逐字比。夹在两个改动块之间的空行不当锚点（md 里每两段之间都有空行），并进同一块，
+  // 否则拆段「一二三四」->「一二 / 三四」会被比成删掉「三四」再插入一遍
   const parts = diffLines(a, b);
+  let ga = '', gb = '';
+  const flush = () => { if (!ga) { if (gb) ins(gb); } else if (!gb) del(ga.length); else chars(ga, gb); ga = gb = ''; };
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i], nx = parts[i + 1];
-    if (p.removed && nx?.added) { chars(p.value, nx.value); i++; }
-    else if (p.added) ins(p.value);
-    else if (p.removed) del(p.value.length);
-    else { pos += p.value.length; bp += p.value.length; }
+    if (p.added) gb += p.value;
+    else if (p.removed) ga += p.value;
+    else if ((ga || gb) && /^\n+$/.test(p.value) && (nx?.added || nx?.removed)) { ga += p.value; gb += p.value; }
+    else { flush(); pos += p.value.length; bp += p.value.length; }
   }
+  flush();
   return out;
 }
 

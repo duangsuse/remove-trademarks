@@ -547,3 +547,85 @@ test('兜底：投影之外的文字（如图形里的 a:t）和批注都报进 
   assert.match(d.warnings.join('\n'), /<a:t> ×1（没投影到的文字，如「形状里的张三」）/);
   assert.match(d.warnings.join('\n'), /<w:comment> ×1（批注）/);
 });
+
+// ---------- 段落结构：拆段 / 新段 / 合并 / 空单元格 ----------
+async function mini(body, extra = {}) {
+  const z = new JSZip();
+  z.file('[Content_Types].xml', '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>');
+  z.file('_rels/.rels', `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}officeDocument" Target="word/document.xml"/></Relationships>`);
+  z.file('word/_rels/document.xml.rels', `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${extra.rels || ''}</Relationships>`);
+  for (const [k, v] of Object.entries(extra.files || {})) z.file(k, v);
+  z.file('word/document.xml', `<?xml version="1.0"?><w:document ${W} ${DRAW}><w:body>${body}<w:sectPr/></w:body></w:document>`);
+  return z.generateAsync({ type: 'uint8array' });
+}
+// 正文各段：文字（+ 插入、- 删除线）、段落标记的修订、样式
+async function paras(data) {
+  const doc = new window.DOMParser().parseFromString(await docXml(data), 'application/xml');
+  const NSW = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const body = doc.getElementsByTagNameNS(NSW, 'body')[0];
+  return [...body.childNodes].filter((n) => n.localName === 'p').map((p) => {
+    const text = [...p.getElementsByTagNameNS(NSW, '*')].filter((x) => x.localName === 't' || x.localName === 'delText')
+      .map((x) => (x.localName === 'delText' ? '-' : x.parentNode.parentNode.localName === 'ins' ? '+' : '') + x.textContent).join('');
+    const mrk = [...p.getElementsByTagNameNS(NSW, 'pPr')].flatMap((pp) => [...(pp.getElementsByTagNameNS(NSW, 'rPr')[0]?.childNodes || [])].map((c) => c.localName)).filter((x) => x === 'ins' || x === 'del').join('');
+    const st = p.getElementsByTagNameNS(NSW, 'pStyle')[0]?.getAttributeNS(NSW, 'val') || '';
+    return [text, mrk, st].filter((x, i) => i === 0 || x).join('|');
+  });
+}
+const review = async (A, B, revisions = true) => {
+  const a = await DocxProjection.load(await mini(A)), b = await DocxProjection.load(await mini(B));
+  const diff = a.diffMd(b.md, { from: b });
+  const out = await a.save({ type: 'uint8array', revisions });
+  return { diff, ...out, orig: a.md };
+};
+
+test('拆段：审阅模式下前一段的段落标记是插入，后一段文字不当删除；重新载入撤回原样', async () => {
+  const { diff, data, orig } = await review(p(t('一二三四')) + p(t('尾')), p(t('一二')) + p(t('三四')) + p(t('尾')));
+  assert.deepEqual(diff, { del: 0, ins: 1, skipped: 0 });
+  assert.deepEqual(await paras(data), ['一二|ins', '三四', '尾']);
+  assert.equal((await DocxProjection.load(data)).md, orig);
+  const plain = await review(p(t('一二三四')) + p(t('尾')), p(t('一二')) + p(t('三四')) + p(t('尾')), false);
+  assert.deepEqual(await paras(plain.data), ['一二', '三四', '尾']);
+});
+
+test('新段：正文末尾 / 两段之间新增的段落是整段插入', async () => {
+  let r = await review(p(t('末尾')), p(t('末尾')) + p(t('新段')));
+  assert.deepEqual(r.diff, { del: 0, ins: 1, skipped: 0 });
+  assert.deepEqual(await paras(r.data), ['末尾|ins', '+新段']);
+  assert.equal((await DocxProjection.load(r.data)).md, r.orig);
+  r = await review(p(t('标题'), '<w:pStyle w:val="Heading1"/>') + p(t('正文')), p(t('标题'), '<w:pStyle w:val="Heading1"/>') + p(t('新段')) + p(t('正文')));
+  assert.deepEqual(await paras(r.data), ['标题|Heading1', '+新段|ins', '正文'], '新段挂在下一段开头，用下一段的格式');
+  assert.equal((await DocxProjection.load(r.data)).md, r.orig);
+});
+
+test('合并：删掉段落标记；删整段时上一段保持原样', async () => {
+  let r = await review(p(t('一二')) + p(t('三四')), p(t('一二三四')));
+  assert.deepEqual(r.diff, { del: 1, ins: 0, skipped: 0 });
+  assert.deepEqual(await paras(r.data), ['一二|del', '三四']);
+  assert.equal((await DocxProjection.load(r.data)).md, r.orig);
+  r = await review(p(t('一二')) + p(t('三四')), p(t('一二三四')), false);
+  assert.deepEqual(await paras(r.data), ['一二三四']);
+  const H = '<w:pStyle w:val="Heading1"/>';
+  r = await review(p(t('甲'), H) + p(t('乙')) + p(t('丙')), p(t('甲'), H) + p(t('丙')), false);
+  assert.deepEqual(await paras(r.data), ['甲|Heading1', '丙']);
+  r = await review(p(t('甲'), H) + p(t('乙')) + p(t('丙')), p(t('甲'), H) + p(t('丙')));
+  assert.deepEqual(await paras(r.data), ['甲|Heading1', '-乙|del', '丙']);
+  assert.equal((await DocxProjection.load(r.data)).md, r.orig);
+});
+
+test('mapPlain：\\n 是分段，\\u2028 是软换行', async () => {
+  const { BR } = await import('../src/plain.js');
+  const d = await DocxProjection.load(await mini(p(t('一二三四'))));
+  d.mapPlain((s) => s.replace('一二三四', `一二\n\n三${BR}四`));
+  const { data } = await d.save({ type: 'uint8array' });
+  assert.deepEqual(await paras(data), ['一二', '三四']);
+  assert.match(await docXml(data), /三<\/w:t><\/w:r><w:r><w:br\/><\/w:r><w:r><w:t[^>]*>四/);
+});
+
+test('空单元格里可以输入', async () => {
+  const tbl = `<w:tbl><w:tr>${tc(t('姓名'))}<w:tc><w:p/></w:tc>${tc(t('电话'))}</w:tr></w:tbl>`;
+  const d = await DocxProjection.load(await mini(tbl));
+  assert.match(d.md, /^\| 姓名 \|  \| 电话 \|$/m);
+  assert.deepEqual(d.mapPlain((s) => s.replace('姓名 |  |', '姓名 | 张三 |')), { del: 0, ins: 1, skipped: 0 });
+  const xml = await docXml((await d.save({ type: 'uint8array', revisions: true })).data);
+  assert.match(xml, /<w:tc><w:p><w:ins [^>]*><w:r><w:t[^>]*>张三<\/w:t><\/w:r><\/w:ins><\/w:p><\/w:tc>/);
+});
