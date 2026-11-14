@@ -21,9 +21,8 @@ export function makeMarks(o = {}) {
 }
 export const MARK = makeMarks();
 
-// docx.js 的默认选项：结构标记；save({track}) 的修订作者；载入时先拒绝掉的修订（本工具以前写的，旧版作者名 ss 只认 id >= 900000）
-const AUTHOR = '脱敏助手';
-export const PROJECTION = { marks: MARK, author: AUTHOR, isOurs: (author, id) => author === AUTHOR || (author === 'ss' && +id >= 900000) };
+// docx.js 的默认选项：结构标记；save({track}) 的修订作者（载入时先拒绝掉这个作者以前写的修订）
+export const PROJECTION = { marks: MARK, author: '脱敏助手' };
 
 // load：逐行标出结构 [{text, s, n, kind, others}]。n 从 1 起；others 为真表示已在「其他文本」区。
 // kind：open / close（特殊表格边界）、cell（特殊表格里的行）、table / tableSep（普通表格行 / 分隔行）、rule（---）、text。

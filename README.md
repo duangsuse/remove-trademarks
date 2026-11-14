@@ -172,8 +172,11 @@ await fs.recall('上次的规则');
 import { makeMarks } from './src/markup.js';
 await DocxProjection.load(buf, {
   marks: makeMarks({ open: '[[表', openNote: '', close: '表]]' }),
-  author: '我的工具',                         // save({ track: true }) 写入的修订作者
-  isOurs: (author) => author === '我的工具',  // 载入时先拒绝掉的修订
+  author: '我的工具',  // save({ track: true }) 写入的修订作者；载入时先拒绝掉这个作者以前写的修订
+  i18n: {              // 界面文字，按组覆盖，默认值见 docx.js 的 I18N
+    parts: { header: 'Header', footer: 'Footer', textbox: 'Text box' },
+    warn: { noMain: (path) => `main part not found: ${path}` },
+  },
 });
 ```
 

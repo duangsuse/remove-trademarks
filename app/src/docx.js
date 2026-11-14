@@ -1,27 +1,60 @@
 // Word <-> Markdown 1:1 投影；差异以修订（w:del / w:ins）写回。三层：docx ⇄ md（本文件）⇄ txt（plain.js）
 // 用法：const d = await DocxProjection.load(buf, opts); d.md / d.text / d.anchor(i)；
 //       d.replace(spans) / d.applyText(newMd) / d.editText(fn, { range })；d.dropImages / d.wipe；await d.save()
-// 不依赖脱敏逻辑；结构标记、修订作者的默认值来自 markup.js，可经 opts 覆盖
+// 不依赖脱敏逻辑；结构标记、修订作者的默认值来自 markup.js，界面文字见 I18N，都可经 opts 覆盖
 import JSZip from 'jszip';
 import { diffLines, diffChars } from 'diff';
 import { PROJECTION } from './markup.js';
-import { plainView, plainEdits } from './plain.js';
+import { plainView, plainEdits, unmark, BR } from './plain.js';
 
-const NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-const XMLNS = 'http://www.w3.org/XML/1998/namespace';
-const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
-const PKG_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
-const MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
-const A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
-const WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
-const PIC_NS = 'http://schemas.openxmlformats.org/drawingml/2006/picture';
-const C_NS = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
-const DGM_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram';
-const V_NS = 'urn:schemas-microsoft-com:vml';
-const isW = (n, name) => n.nodeType === 1 && n.namespaceURI === NS && n.localName === name;
+const NS = {
+  WORD: 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+  XML: 'http://www.w3.org/XML/1998/namespace',
+  R: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+  PKG: 'http://schemas.openxmlformats.org/package/2006/relationships',
+  MC: 'http://schemas.openxmlformats.org/markup-compatibility/2006',
+  A: 'http://schemas.openxmlformats.org/drawingml/2006/main',
+  WP: 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+  PIC: 'http://schemas.openxmlformats.org/drawingml/2006/picture',
+  C: 'http://schemas.openxmlformats.org/drawingml/2006/chart',
+  DGM: 'http://schemas.openxmlformats.org/drawingml/2006/diagram',
+  V: 'urn:schemas-microsoft-com:vml',
+};
+// 正文以外要投影的部件（主文档关系的类型），标题见 I18N.parts
+const TEXT_PARTS = ['header', 'footer', 'footnotes', 'endnotes'];
+
+// 界面文字，opts.i18n 按组覆盖：{ parts: { header: 'Header' }, warn: { noMain: (p) => … } }
+export const I18N = {
+  parts: { header: '页眉', footer: '页脚', footnotes: '脚注', endnotes: '尾注', textbox: '文本框', chart: '图表', smartart: 'SmartArt' },
+  notes: { oMath: '公式', oMathPara: '公式', ruby: '注音', altChunk: '嵌入的外部文档', object: 'OLE 对象' }, // unhandled 里各标签的说明
+  warn: {
+    parseFailed: (path) => `${path} 解析失败，其中的文字没有处理`,
+    noMain: (path) => `找不到正文 ${path}`,
+    unhandled: (list) => '以下元素没有投影，其中的文字没有处理：\n' + list.map(({ tag, count, note }) => `    <${tag}> ×${count}` + (note ? `（${note}）` : '')).join('\n'),
+    embeddings: (n) => `有 ${n} 个内嵌对象（Excel / Visio / 图表数据等，word/embeddings/），里面的内容原样保留`,
+    vectors: (n) => `有 ${n} 张 svg / emf 等格式的图片不能替换成占位图（svg 常与同名 png 成对，只换 png 时 Word 仍显示 svg）`,
+    newImages: (n) => `${n} 处新增图片被忽略（图片只能删除、移动或复制文档里已有的：路径须与原图相同，且在同一部分——正文 / 页眉等不能互相搬）`,
+    untracked: (n) => `${n} 处链接地址 / 图片说明 / 图表文字无法写成修订，未改动`,
+    failed: (n) => `${n} 段写入失败（详见控制台），这些段落保持原样`,
+    smartArt: (n) => `SmartArt 缓存里有 ${n} 处文字没对上，可能还残留原文（在 Word 里点一下该 SmartArt 会重新排版）`,
+    savedTwice: 'DocxProjection.save() 只能调用一次',
+  },
+};
+const mergeI18n = (o = {}) => Object.fromEntries(Object.entries(I18N).map(([k, v]) => [k, { ...v, ...o[k] }]));
+
+// 1×1 占位图（dropImages），按扩展名
+const PLACEHOLDER = {
+  png: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGM4e/YsAATSAmjiBBWmAAAAAElFTkSuQmCC',
+  gif: 'R0lGODdhAQABAIEAAM3NzQAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw==',
+  bmp: 'Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAADEDgAAxA4AAAAAAAAAAAAAzc3NAA==',
+  jpg: '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD02iiigD//2Q==',
+};
+const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp' };
+
+const isW = (n, name) => n.nodeType === 1 && n.namespaceURI === NS.WORD && n.localName === name;
 const kids = (n, name) => (n ? [...n.childNodes].filter((c) => isW(c, name)) : []);
 const kid = (n, name) => (n ? [...n.childNodes].find((c) => isW(c, name)) : undefined);
-const val = (el) => el?.getAttributeNS(NS, 'val') ?? null;
+const val = (el) => el?.getAttributeNS(NS.WORD, 'val') ?? null;
 const on = (el) => !!el && !['0', 'false', 'off'].includes(val(el) ?? '1');
 const inFallback = (el) => { for (let n = el.parentNode; n && n.nodeType === 1; n = n.parentNode) if (n.localName === 'Fallback') return true; return false; };
 // root 下第一个 ns:name，不进文本框（文本框里的图片属于文本框自己的段落）
@@ -39,9 +72,9 @@ function own(root, ns, name) {
 // 返回 look(styleId, f)：沿 basedOn 链找第一个 f(style) 不为空的值
 function styleLookup(doc) {
   const map = new Map();
-  for (const s of doc ? doc.getElementsByTagNameNS(NS, 'style') : []) {
+  for (const s of doc ? doc.getElementsByTagNameNS(NS.WORD, 'style') : []) {
     const pPr = kid(s, 'pPr');
-    map.set(s.getAttributeNS(NS, 'styleId'), { name: (val(kid(s, 'name')) || '').toLowerCase(), based: val(kid(s, 'basedOn')), outline: val(kid(pPr, 'outlineLvl')), numPr: kid(pPr, 'numPr'), rPr: kid(s, 'rPr') });
+    map.set(s.getAttributeNS(NS.WORD, 'styleId'), { name: (val(kid(s, 'name')) || '').toLowerCase(), based: val(kid(s, 'basedOn')), outline: val(kid(pPr, 'outlineLvl')), numPr: kid(pPr, 'numPr'), rPr: kid(s, 'rPr') });
   }
   return (id, f) => {
     for (let k = 0; id && k < 16; k++) {
@@ -83,15 +116,15 @@ class Lists {
   constructor(doc, style) {
     this.style = style; this.abs = new Map(); this.nums = new Map(); this.cnt = new Map();
     if (!doc) return;
-    for (const a of doc.getElementsByTagNameNS(NS, 'abstractNum')) {
+    for (const a of doc.getElementsByTagNameNS(NS.WORD, 'abstractNum')) {
       const lv = new Map();
-      for (const l of kids(a, 'lvl')) lv.set(+l.getAttributeNS(NS, 'ilvl'), { fmt: val(kid(l, 'numFmt')) || 'decimal', text: val(kid(l, 'lvlText')) ?? '', start: +(val(kid(l, 'start')) ?? 1) });
-      this.abs.set(a.getAttributeNS(NS, 'abstractNumId'), lv);
+      for (const l of kids(a, 'lvl')) lv.set(+l.getAttributeNS(NS.WORD, 'ilvl'), { fmt: val(kid(l, 'numFmt')) || 'decimal', text: val(kid(l, 'lvlText')) ?? '', start: +(val(kid(l, 'start')) ?? 1) });
+      this.abs.set(a.getAttributeNS(NS.WORD, 'abstractNumId'), lv);
     }
-    for (const n of doc.getElementsByTagNameNS(NS, 'num')) {
+    for (const n of doc.getElementsByTagNameNS(NS.WORD, 'num')) {
       const start = new Map();
-      for (const o of kids(n, 'lvlOverride')) { const so = val(kid(o, 'startOverride')); if (so != null) start.set(+o.getAttributeNS(NS, 'ilvl'), +so); }
-      this.nums.set(n.getAttributeNS(NS, 'numId'), { abs: val(kid(n, 'abstractNumId')), start });
+      for (const o of kids(n, 'lvlOverride')) { const so = val(kid(o, 'startOverride')); if (so != null) start.set(+o.getAttributeNS(NS.WORD, 'ilvl'), +so); }
+      this.nums.set(n.getAttributeNS(NS.WORD, 'numId'), { abs: val(kid(n, 'abstractNumId')), start });
     }
   }
 
@@ -211,7 +244,7 @@ function plainTable(tbl) {
       const pr = kid(tc, 'tcPr');
       if (pr && (kid(pr, 'vMerge') || kid(pr, 'hMerge') || (kid(pr, 'gridSpan') && +val(kid(pr, 'gridSpan')) > 1))) return null;
       const ps = kids(tc, 'p');
-      const other = [...tc.childNodes].some((x) => x.nodeType === 1 && x.namespaceURI === NS && !['tcPr', 'p'].includes(x.localName));
+      const other = [...tc.childNodes].some((x) => x.nodeType === 1 && x.namespaceURI === NS.WORD && !['tcPr', 'p'].includes(x.localName));
       if (other || ps.length !== 1) return null;
       row.push(ps[0]);
     }
@@ -222,37 +255,35 @@ function plainTable(tbl) {
 
 // 本工具上一次写入的修订先「拒绝」掉再投影：删除线里的原文还原成正常文字，插入的内容去掉。
 // 否则 Ctrl+Enter 写入审阅修订后，重新载入 A 时原文已经藏在 w:del 里，投影看不到旧内容、黑名单就扫不出来了；
-// 同时重复写入审阅不会叠加。isOurs(author, id) 判定哪些是自己的，别的作者的修订保持原样。返回处理的数量。
-function rejectOurs(doc, isOurs) {
+// 同时重复写入审阅不会叠加。只认作者 author，别的作者的修订保持原样。返回处理的数量。
+function rejectOurs(doc, author) {
   let n = 0;
-  const byTag = (t) => [...doc.getElementsByTagNameNS(NS, t)].filter((x) => isOurs(x.getAttributeNS(NS, 'author'), x.getAttributeNS(NS, 'id')));
+  const byTag = (t) => [...doc.getElementsByTagNameNS(NS.WORD, t)].filter((x) => x.getAttributeNS(NS.WORD, 'author') === author);
   for (const x of byTag('ins')) { if (x.parentNode && x.parentNode.localName !== 'rPr') { x.remove(); n++; } }
   for (const x of byTag('del')) {
     if (!x.parentNode || x.parentNode.localName === 'rPr') continue;
-    for (const dt of [...x.getElementsByTagNameNS(NS, 'delText')]) dt.replaceWith(mkText(doc, 't', dt.textContent));
+    for (const dt of [...x.getElementsByTagNameNS(NS.WORD, 'delText')]) dt.replaceWith(mkText(doc, 't', dt.textContent));
     while (x.firstChild) x.parentNode.insertBefore(x.firstChild, x);
     x.remove(); n++;
   }
   return n;
 }
 
-async function loadXml(zip, path, warnings) {
+async function loadXml(zip, path, onFail) {
   const f = path && zip.file(path);
   if (!f) return null;
   const doc = new DOMParser().parseFromString(await f.async('string'), 'application/xml');
-  if (doc.getElementsByTagName('parsererror').length) { warnings.push(`${path} 解析失败，其中的文字没有处理`); return null; }
+  if (doc.getElementsByTagName('parsererror').length) { onFail(path); return null; }
   return doc;
 }
 const relsPathOf = (path) => path.replace(/([^/]*)$/, '_rels/$1.rels');
 const resolvePath = (base, target) => decodeURIComponent(new URL(target, 'http://x/' + base).pathname.slice(1));
 const baseName = (path) => path.split('/').pop().replace(/\.xml$/, '');
-const TEXT_PARTS = { header: '页眉', footer: '页脚', footnotes: '脚注', endnotes: '尾注' };
 const HYPER = /^(\s*HYPERLINK\s+")([^"]+)(")/i;
 const INLINE_WRAP = new Set(['smartTag', 'sdt', 'sdtContent', 'dir', 'bdo', 'customXml']);
 // 投影不了的元素：不写投影，只按标签名列进 unhandled 清单。删除的修订 / 域代码 / 文本框（另行处理）里的文字不算
 const NO_TEXT = new Set(['del', 'moveFrom', 'delText', 'delInstrText', 'instrText', 'txbxContent', 'rPr', 'pPr']);
 const hasText = (el) => [...el.childNodes].some((c) => (c.nodeType === 3 ? c.data.trim() : c.nodeType === 1 && !NO_TEXT.has(c.localName) && hasText(c)));
-const UNHANDLED_NOTE = { oMath: '公式', oMathPara: '公式', ruby: '注音', altChunk: '嵌入的外部文档', object: 'OLE 对象' };
 
 // ---------- 编辑记录 ----------
 // 插入文本里的 ![..](路径)：不是新增图片，而是移动（放回被删掉的同路径图片）或复制（克隆文档里已有的同路径图片）。文本里换成 OBJ，路径按顺序记进 refs，保存时再配对
@@ -272,7 +303,6 @@ class Edits extends Map {
 }
 // md 区间 [a, b) 整个包住的图片（只包住一半的不算：结构字符不可编辑）
 const coveredImgs = (images, a, b) => images.filter((x) => !x.locked && x.s >= a && x.e <= b);
-const unmark = (s) => s.replace(/\\([\s\S])|\*+/g, (m, c) => c ?? '').replace(/<br>/g, '\n');
 
 // md 位置 p 处插入：挂到前一个字之后，否则挂到后一个字之前；结构位置（不属于任何单元）返回 null
 function insertAnchor(map, p) {
@@ -293,7 +323,7 @@ function computeEdits(origMd, newMd, map, newMap, edits, images = []) {
   };
   const ins = (p, text, np, raw) => {
     if (newMap) { let t = ''; for (let i = 0; i < text.length; i++) if (newMap.ed[np + i]) t += text[i]; text = t; }
-    else text = (raw ? unmark(text) : text).replace(/\r\n?/g, '\n');
+    else text = (raw ? unmark(text).replaceAll(BR, '\n') : text).replace(/\r\n?/g, '\n');
     if (!text) return;
     const a = insertAnchor(map, p);
     if (!a) { stats.skipped++; return; }
@@ -334,13 +364,13 @@ function computeEdits(origMd, newMd, map, newMap, edits, images = []) {
 
 // ---------- 写入修订 ----------
 function mkEl(doc, name, attrs = {}) {
-  const el = doc.createElementNS(NS, 'w:' + name);
-  for (const [k, v] of Object.entries(attrs)) el.setAttributeNS(NS, 'w:' + k, v);
+  const el = doc.createElementNS(NS.WORD, 'w:' + name);
+  for (const [k, v] of Object.entries(attrs)) el.setAttributeNS(NS.WORD, 'w:' + k, v);
   return el;
 }
 function mkText(doc, name, text) {
   const t = mkEl(doc, name);
-  t.setAttributeNS(XMLNS, 'xml:space', 'preserve');
+  t.setAttributeNS(NS.XML, 'xml:space', 'preserve');
   t.textContent = text;
   return t;
 }
@@ -439,11 +469,11 @@ function applyTextEdits(u, ed) {
 // 文本框 mc:AlternateContent：投影 / 编辑的是 Choice（wps），Fallback（VML）里还有一份原文——改过的照 Choice 同步过去
 function syncFallbacks(edited) {
   const acs = new Set();
-  for (const el of edited) for (let n = el.parentNode; n && n.nodeType === 1; n = n.parentNode) if (n.namespaceURI === MC_NS && n.localName === 'Choice') acs.add(n.parentNode);
+  for (const el of edited) for (let n = el.parentNode; n && n.nodeType === 1; n = n.parentNode) if (n.namespaceURI === NS.MC && n.localName === 'Choice') acs.add(n.parentNode);
   const depth = (n) => { let d = 0; for (; n; n = n.parentNode) d++; return d; };
-  const outer = (root) => [...root.getElementsByTagNameNS(NS, 'txbxContent')].filter((tb) => { for (let n = tb.parentNode; n && n !== root; n = n.parentNode) if (n.localName === 'txbxContent') return false; return true; });
+  const outer = (root) => [...root.getElementsByTagNameNS(NS.WORD, 'txbxContent')].filter((tb) => { for (let n = tb.parentNode; n && n !== root; n = n.parentNode) if (n.localName === 'txbxContent') return false; return true; });
   for (const ac of [...acs].sort((a, b) => depth(b) - depth(a))) { // 先内层后外层
-    const pick = (name) => [...ac.childNodes].find((x) => x.namespaceURI === MC_NS && x.localName === name);
+    const pick = (name) => [...ac.childNodes].find((x) => x.namespaceURI === NS.MC && x.localName === name);
     const choice = pick('Choice'), fb = pick('Fallback');
     if (!choice || !fb) continue;
     const src = outer(choice), dst = outer(fb);
@@ -459,7 +489,7 @@ function syncFallbacks(edited) {
 function mirrorSmartArt(parts, map) {
   if (!parts.length) return 0;
   const hit = new Set();
-  for (const part of parts) for (const t of part.doc.getElementsByTagNameNS(A_NS, 't')) {
+  for (const part of parts) for (const t of part.doc.getElementsByTagNameNS(NS.A, 't')) {
     if (!map.has(t.textContent)) continue;
     hit.add(t.textContent); t.textContent = map.get(t.textContent); part.dirty = true;
   }
@@ -468,13 +498,13 @@ function mirrorSmartArt(parts, map) {
 
 function maxId(parts) {
   let m = 0;
-  for (const p of parts) for (const el of p.doc.getElementsByTagName('*')) { const v = el.getAttributeNS(NS, 'id'); if (v && /^\d+$/.test(v)) m = Math.max(m, +v); }
+  for (const p of parts) for (const el of p.doc.getElementsByTagName('*')) { const v = el.getAttributeNS(NS.WORD, 'id'); if (v && /^\d+$/.test(v)) m = Math.max(m, +v); }
   return m;
 }
 
 // ---------- 投影 ----------
 export class DocxProjection {
-  opts = null; // { marks, author, isOurs }
+  opts = null; // { marks, author, i18n }
   zip = null;
   parts = new Map(); // path -> {path, doc, dirty}（含 .rels）
   textParts = []; // 正文 + 页眉页脚脚注尾注
@@ -491,17 +521,17 @@ export class DocxProjection {
   #wipe = false;
   #saved = false;
 
-  // opts（默认见 markup.js PROJECTION）：marks 结构标记（makeMarks）；author save({track}) 的修订作者；
-  // isOurs(author, id) 载入时先拒绝掉的修订
+  // opts（默认见 markup.js PROJECTION）：marks 结构标记（makeMarks）；author save({track}) 的修订作者，载入时先拒绝掉这个作者的修订；
+  // i18n 界面文字（见 I18N，按组覆盖）
   static async load(buffer, opts = {}) {
     const d = new DocxProjection();
-    d.opts = { ...PROJECTION, ...opts };
+    d.opts = { ...PROJECTION, ...opts, i18n: mergeI18n(opts.i18n) };
     await d.#load(buffer);
     return d;
   }
 
   // md -> txt 投影（去掉转义与粗斜体标记），editText 的 fn 拿到的就是它（或其中一段）
-  get text() { return plainView(this.md).text; }
+  get text() { return plainView(this.md, this.opts.marks).text; }
 
   // md 第 i 个字符对应的位置；结构字符（Markdown 标记、表格竖线等）editable 为 false
   anchor(i) {
@@ -540,7 +570,7 @@ export class DocxProjection {
   // 用函数改纯文本投影：fn(text) -> 新 text，差异写回。range=[s, e]（md 坐标，如 lineRange(d.md, 11, 22)）时 fn 只拿到这一段。
   // 坐标都基于载入时的投影：多次调用是在原文上叠加，不会看到前一次的结果
   editText(fn, { range } = {}) {
-    return this.replace(plainEdits(this.md, fn, range));
+    return this.replace(plainEdits(this.md, fn, range, this.opts.marks));
   }
 
   dropImages(paths) { this.#drop.push(...paths); return this; }
@@ -548,9 +578,9 @@ export class DocxProjection {
 
   // track：写成审阅修订（作者 author）；type 同 JSZip.generateAsync。DOM 会被改写，只能调用一次
   async save({ track = false, author = this.opts.author, type = 'blob' } = {}) {
-    if (this.#saved) throw new Error('DocxProjection.save() 只能调用一次');
+    if (this.#saved) throw new Error(this.opts.i18n.warn.savedTwice);
     this.#saved = true;
-    const warnings = [...this.warnings], stats = { ...this.stats };
+    const warnings = [...this.warnings], stats = { ...this.stats }, t = this.opts.i18n;
     const ctx = { author, date: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), nextId: maxId(this.textParts) + 1, track };
     const edited = [], mirror = new Map();
     let untracked = 0, failed = 0;
@@ -574,12 +604,12 @@ export class DocxProjection {
         u.el.replaceWith(backup); // 半途失败的段落整段还原
       }
     }
-    if (added) { warnings.push(`${added} 处新增图片被忽略（图片只能删除、移动或复制文档里已有的：路径须与原图相同，且在同一部分——正文 / 页眉等不能互相搬）`); stats.ins = Math.max(0, stats.ins - added); stats.skipped += added; }
-    if (untracked) warnings.push(`${untracked} 处链接地址 / 图片说明 / 图表文字无法写成修订，未改动`);
-    if (failed) { warnings.push(`${failed} 段写入失败（详见控制台），这些段落保持原样`); stats.skipped += failed; }
+    if (added) { warnings.push(t.warn.newImages(added)); stats.ins = Math.max(0, stats.ins - added); stats.skipped += added; }
+    if (untracked) warnings.push(t.warn.untracked(untracked));
+    if (failed) { warnings.push(t.warn.failed(failed)); stats.skipped += failed; }
     syncFallbacks(edited);
     const miss = mirror.size ? mirrorSmartArt(this.#mirrors, mirror) : 0;
-    if (miss) warnings.push(`SmartArt 缓存里有 ${miss} 处文字没对上，可能还残留原文（在 Word 里点一下该 SmartArt 会重新排版）`);
+    if (miss) warnings.push(t.warn.smartArt(miss));
     const wiped = new Set(this.#wipe ? this.textParts : []);
     for (const part of wiped) cleanDom(part.doc);
     for (const part of this.parts.values()) {
@@ -609,8 +639,8 @@ export class DocxProjection {
     };
     const gone = this.#edits.dropped.map((img) => ({ img, r: objRun(img), used: false }));
     let ignored = 0, docPr = 0; // wp:docPr 的 id（与 w:id 是两套编号）
-    for (const part of this.textParts) for (const el of part.doc.getElementsByTagNameNS(WP_NS, 'docPr')) docPr = Math.max(docPr, +el.getAttribute('id') || 0);
-    const renew = (r) => { for (const el of r.getElementsByTagNameNS(WP_NS, 'docPr')) el.setAttribute('id', String(++docPr)); };
+    for (const part of this.textParts) for (const el of part.doc.getElementsByTagNameNS(NS.WP, 'docPr')) docPr = Math.max(docPr, +el.getAttribute('id') || 0);
+    const renew = (r) => { for (const el of r.getElementsByTagNameNS(NS.WP, 'docPr')) el.setAttribute('id', String(++docPr)); };
     for (const [pid, ed] of this.#edits) {
       for (const [at, paths] of ed.refs) {
         const u = this.units[pid], nodes = [];
@@ -632,10 +662,10 @@ export class DocxProjection {
 
   async #load(buffer) {
     const zip = (this.zip = await JSZip.loadAsync(buffer));
-    const { parts, warnings, units } = this, { marks, isOurs } = this.opts;
+    const { parts, warnings, units } = this, { marks, author, i18n: t } = this.opts;
     const load = async (path) => {
       if (!path) return null;
-      if (!parts.has(path)) { const doc = await loadXml(zip, path, warnings); parts.set(path, doc ? { path, doc, dirty: false } : null); }
+      if (!parts.has(path)) { const doc = await loadXml(zip, path, (p) => warnings.push(t.warn.parseFailed(p))); parts.set(path, doc ? { path, doc, dirty: false } : null); }
       return parts.get(path);
     };
     const relsOf = new Map(); // 部件 path -> Map(rId -> rel)
@@ -644,7 +674,7 @@ export class DocxProjection {
       const m = new Map();
       relsOf.set(path, m);
       const rp = await load(relsPathOf(path));
-      for (const el of rp ? rp.doc.getElementsByTagNameNS(PKG_NS, 'Relationship') : []) {
+      for (const el of rp ? rp.doc.getElementsByTagNameNS(NS.PKG, 'Relationship') : []) {
         const external = el.getAttribute('TargetMode') === 'External', target = el.getAttribute('Target') || '';
         m.set(el.getAttribute('Id'), { el, part: rp, type: (el.getAttribute('Type') || '').split('/').pop(), external, target, path: external ? target : resolvePath(path, target) });
       }
@@ -657,9 +687,9 @@ export class DocxProjection {
     const style = styleLookup((await load(ofType('styles')[0]))?.doc);
     const lists = new Lists((await load(ofType('numbering')[0]))?.doc, style);
     const others = [];
-    for (const t in TEXT_PARTS) for (const p of ofType(t)) { const part = await load(p); if (part) others.push({ type: t, part }); }
+    for (const type of TEXT_PARTS) for (const p of ofType(type)) { const part = await load(p); if (part) others.push({ type, part }); }
     this.textParts = [main, ...others.map((o) => o.part)].filter(Boolean);
-    for (const part of this.textParts) { await rels(part.path); if (rejectOurs(part.doc, isOurs)) part.dirty = true; }
+    for (const part of this.textParts) { await rels(part.path); if (rejectOurs(part.doc, author)) part.dirty = true; }
 
     const unit = (u) => { u.idx = units.length; units.push(u); return u; };
     const textUnit = (part, text, set, extra) => unit({ kind: 'text', part, atoms: [...text].map((ch) => ({ ch, edit: true })), set, ...extra });
@@ -668,7 +698,7 @@ export class DocxProjection {
     const found = []; // 正文里发现的文本框 / 图表 / SmartArt，放到「其他文本」区
     const linkUnits = new Map();
     const relLink = (h, part) => {
-      const r = relsOf.get(part.path)?.get(h.getAttributeNS(R_NS, 'id'));
+      const r = relsOf.get(part.path)?.get(h.getAttributeNS(NS.R, 'id'));
       if (!r?.external) return null; // 文档内锚点（目录等）不显示成链接
       if (!linkUnits.has(r.el)) linkUnits.set(r.el, { unit: textUnit(r.part, r.target, (v) => r.el.setAttribute('Target', v)) });
       return linkUnits.get(r.el);
@@ -680,17 +710,17 @@ export class DocxProjection {
     const object = (d, part) => {
       const rel = (id) => (id ? relsOf.get(part.path)?.get(id) : null);
       let label = '', target = null, embed = '';
-      const blip = own(d, A_NS, 'blip'), vimg = own(d, V_NS, 'imagedata'), gd = own(d, A_NS, 'graphicData');
-      if (blip) target = rel(blip.getAttributeNS(R_NS, 'embed') || blip.getAttributeNS(R_NS, 'link'));
-      else if (vimg) target = rel(vimg.getAttributeNS(R_NS, 'id'));
+      const blip = own(d, NS.A, 'blip'), vimg = own(d, NS.V, 'imagedata'), gd = own(d, NS.A, 'graphicData');
+      if (blip) target = rel(blip.getAttributeNS(NS.R, 'embed') || blip.getAttributeNS(NS.R, 'link'));
+      else if (vimg) target = rel(vimg.getAttributeNS(NS.R, 'id'));
       else if (gd) {
         const uri = gd.getAttribute('uri') || '';
-        if (uri.endsWith('/chart')) { label = '图表'; embed = 'chart'; target = rel(own(gd, C_NS, 'chart')?.getAttributeNS(R_NS, 'id')); }
-        else if (uri.endsWith('/diagram')) { label = 'SmartArt'; embed = 'smartart'; target = rel(own(gd, DGM_NS, 'relIds')?.getAttributeNS(R_NS, 'dm')); }
+        if (uri.endsWith('/chart')) { label = t.parts.chart; embed = 'chart'; target = rel(own(gd, NS.C, 'chart')?.getAttributeNS(NS.R, 'id')); }
+        else if (uri.endsWith('/diagram')) { label = t.parts.smartart; embed = 'smartart'; target = rel(own(gd, NS.DGM, 'relIds')?.getAttributeNS(NS.R, 'dm')); }
       }
       if (!target) return null;
       if (embed && !target.external) found.push({ embed, path: target.path });
-      const docPr = own(d, WP_NS, 'docPr'), cNvPr = own(d, PIC_NS, 'cNvPr');
+      const docPr = own(d, NS.WP, 'docPr'), cNvPr = own(d, NS.PIC, 'cNvPr');
       const attr = (name) => {
         const v = docPr?.getAttribute(name);
         return v ? textUnit(part, v, (nv) => { docPr.setAttribute(name, nv); if (cNvPr?.getAttribute(name) === v) cNvPr.setAttribute(name, nv); }) : null;
@@ -709,12 +739,12 @@ export class DocxProjection {
           if (c.nodeType !== 1) continue;
           const base = { r, item: c, fmt, locked, link: cur() };
           const obj = (d) => { const o = d && object(d, part); if (o) atoms.push({ ...base, ch: '￼', obj: o, edit: false }); };
-          if (c.namespaceURI === MC_NS && c.localName === 'AlternateContent') {
+          if (c.namespaceURI === NS.MC && c.localName === 'AlternateContent') {
             const ch = [...c.childNodes].find((x) => x.localName === 'Choice');
             obj(ch && [...ch.childNodes].find((x) => isW(x, 'drawing')));
             continue;
           }
-          if (c.namespaceURI !== NS) { stray(c); continue; }
+          if (c.namespaceURI !== NS.WORD) { stray(c); continue; }
           switch (c.localName) {
             case 't': for (const ch of c.textContent) atoms.push({ ...base, ch, edit: !locked }); break;
             case 'tab': atoms.push({ ...base, ch: '\t', edit: !locked }); break;
@@ -723,7 +753,7 @@ export class DocxProjection {
             case 'drawing': case 'pict': obj(c); break;
             case 'instrText': fields.at(-1)?.instr.push(c); break;
             case 'fldChar': {
-              const t = c.getAttributeNS(NS, 'fldCharType');
+              const t = c.getAttributeNS(NS.WORD, 'fldCharType');
               if (t === 'begin') fields.push({ instr: [], link: null });
               else if (t === 'end') fields.pop();
               else if (t === 'separate' && fields.length) {
@@ -739,13 +769,13 @@ export class DocxProjection {
       const walk = (n, locked) => {
         for (const c of n.childNodes) {
           if (c.nodeType !== 1) continue;
-          if (c.namespaceURI !== NS) { stray(c); continue; }
+          if (c.namespaceURI !== NS.WORD) { stray(c); continue; }
           const ln = c.localName;
           if (ln === 'r') addRun(c, locked);
           else if (ln === 'ins' || ln === 'moveTo') walk(c, true);
           else if (ln === 'hyperlink' || ln === 'fldSimple') {
             const prev = link;
-            link = (ln === 'hyperlink' ? relLink(c, part) : fieldLink(() => c.getAttributeNS(NS, 'instr') || '', (v) => c.setAttributeNS(NS, 'w:instr', v), part)) || link;
+            link = (ln === 'hyperlink' ? relLink(c, part) : fieldLink(() => c.getAttributeNS(NS.WORD, 'instr') || '', (v) => c.setAttributeNS(NS.WORD, 'w:instr', v), part)) || link;
             walk(c, locked);
             link = prev;
           } else if (INLINE_WRAP.has(ln)) walk(c, locked);
@@ -760,17 +790,17 @@ export class DocxProjection {
     const mkPara = (p, part) => { const atoms = collect(p, part); return atoms.length ? unit({ kind: 'para', el: p, part, atoms }) : null; };
     const listPrefix = (lab, indent) => (lab ? (indent ? '  '.repeat(lab.ilvl) : '') + lab.text + ' ' : '');
     const scanTextboxes = (p, part) => {
-      for (const tb of p.getElementsByTagNameNS(NS, 'txbxContent')) {
+      for (const tb of p.getElementsByTagNameNS(NS.WORD, 'txbxContent')) {
         if (inFallback(tb)) continue;
         let outer = true;
         for (let n = tb.parentNode; n && n.nodeType === 1; n = n.parentNode) if (n.localName === 'txbxContent') { outer = false; break; }
-        if (outer) found.push({ title: '文本框', container: tb, part });
+        if (outer) found.push({ title: t.parts.textbox, container: tb, part });
       }
     };
     const walkBlocks = (container, part) => {
       for (const c of container.childNodes) {
         if (c.nodeType !== 1) continue;
-        if (c.namespaceURI !== NS) { stray(c); continue; }
+        if (c.namespaceURI !== NS.WORD) { stray(c); continue; }
         if (c.localName === 'p') {
           scanTextboxes(c, part);
           const lab = lists.label(c); // 空段落也要计数
@@ -818,7 +848,7 @@ export class DocxProjection {
     const walkCell = (tc, part) => {
       for (const c of tc.childNodes) {
         if (c.nodeType !== 1) continue;
-        if (c.namespaceURI !== NS) { stray(c); continue; }
+        if (c.namespaceURI !== NS.WORD) { stray(c); continue; }
         if (c.localName === 'p') {
           scanTextboxes(c, part);
           const lab = lists.label(c), para = mkPara(c, part);
@@ -830,16 +860,16 @@ export class DocxProjection {
       }
     };
 
-    if (main) { const body = main.doc.getElementsByTagNameNS(NS, 'body')[0]; if (body) walkBlocks(body, main); }
-    else warnings.push(`找不到正文 ${mainPath}`);
+    if (main) { const body = main.doc.getElementsByTagNameNS(NS.WORD, 'body')[0]; if (body) walkBlocks(body, main); }
+    else warnings.push(t.warn.noMain(mainPath));
 
     // 其他文本放末尾：页眉页脚 / 脚注尾注，然后是正文里发现的文本框 / 图表 / SmartArt（处理中再发现的接着排）
     const queue = [];
     for (const { type, part } of others) {
-      const title = TEXT_PARTS[type] + (type === 'header' || type === 'footer' ? ' ' + baseName(part.path) : '');
+      const title = t.parts[type] + (type === 'header' || type === 'footer' ? ' ' + baseName(part.path) : '');
       if (type === 'footnotes' || type === 'endnotes') {
         for (const fn of part.doc.documentElement.childNodes) {
-          if (fn.nodeType !== 1 || ['separator', 'continuationSeparator', 'continuationNotice'].includes(fn.getAttributeNS(NS, 'type'))) continue;
+          if (fn.nodeType !== 1 || ['separator', 'continuationSeparator', 'continuationNotice'].includes(fn.getAttributeNS(NS.WORD, 'type'))) continue;
           queue.push({ title, container: fn, part });
         }
       } else queue.push({ title, container: part.doc.documentElement, part });
@@ -854,11 +884,11 @@ export class DocxProjection {
       if (!part) return null;
       const nodeUnit = (el, mirror) => textUnit(part, el.textContent, (v) => { el.textContent = v; }, mirror ? { mirror, orig: el.textContent } : {});
       if (x.embed === 'chart') {
-        const els = [...part.doc.getElementsByTagName('*')].filter((el) => el.textContent.trim() && ((el.namespaceURI === A_NS && el.localName === 't') || (el.namespaceURI === C_NS && el.localName === 'v' && ['strCache', 'strLit'].includes(el.parentNode?.parentNode?.localName))));
-        return { title: '图表 ' + baseName(x.path), units: els.map((el) => nodeUnit(el)) };
+        const els = [...part.doc.getElementsByTagName('*')].filter((el) => el.textContent.trim() && ((el.namespaceURI === NS.A && el.localName === 't') || (el.namespaceURI === NS.C && el.localName === 'v' && ['strCache', 'strLit'].includes(el.parentNode?.parentNode?.localName))));
+        return { title: t.parts.chart + ' ' + baseName(x.path), units: els.map((el) => nodeUnit(el)) };
       }
-      const els = [...part.doc.getElementsByTagNameNS(A_NS, 't')].filter((el) => el.textContent.trim());
-      return { title: 'SmartArt ' + baseName(x.path), units: els.map((el) => nodeUnit(el, true)) };
+      const els = [...part.doc.getElementsByTagNameNS(NS.A, 't')].filter((el) => el.textContent.trim());
+      return { title: t.parts.smartart + ' ' + baseName(x.path), units: els.map((el) => nodeUnit(el, true)) };
     };
     let first = true;
     for (let i = 0; i < queue.length; i++) {
@@ -878,11 +908,11 @@ export class DocxProjection {
 
     // 投影不到的内容：列出来提醒
     this.unhandled = [...unhandled].map(([tag, count]) => ({ tag, count }));
-    if (unhandled.size) warnings.push('以下元素没有投影，其中的文字没有处理：\n' + this.unhandled.map(({ tag, count }) => `    <${tag}> ×${count}` + (UNHANDLED_NOTE[tag.split(':').pop()] ? `（${UNHANDLED_NOTE[tag.split(':').pop()]}）` : '')).join('\n'));
+    if (unhandled.size) warnings.push(t.warn.unhandled(this.unhandled.map((u) => ({ ...u, note: t.notes[u.tag.split(':').pop()] }))));
     const emb = Object.keys(zip.files).filter((p) => /^word\/embeddings\/[^/]+$/.test(p));
-    if (emb.length) warnings.push(`有 ${emb.length} 个内嵌对象（Excel / Visio / 图表数据等，word/embeddings/），里面的内容原样保留`);
+    if (emb.length) warnings.push(t.warn.embeddings(emb.length));
     const vec = Object.keys(zip.files).filter((p) => /^word\/media\/[^/]+\.(?:svg|emf|wmf|tiff?)$/i.test(p));
-    if (vec.length) warnings.push(`有 ${vec.length} 张 svg / emf 等格式的图片不能替换成占位图（svg 常与同名 png 成对，只换 png 时 Word 仍显示 svg）`);
+    if (vec.length) warnings.push(t.warn.vectors(vec.length));
 
     this.images = md.imgs;
     this.md = md.out.join('');
@@ -891,14 +921,7 @@ export class DocxProjection {
 }
 
 // ---------- 图片 / 不可见元素 ----------
-const PLACEHOLDER = {
-  png: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGM4e/YsAATSAmjiBBWmAAAAAElFTkSuQmCC',
-  gif: 'R0lGODdhAQABAIEAAM3NzQAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw==',
-  bmp: 'Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAADEDgAAxA4AAAAAAAAAAAAAzc3NAA==',
-  jpg: '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD02iiigD//2Q==',
-};
 const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp' };
 
 // word/media/* 与 docProps/thumbnail.*；replaceable 表示本工具能换成占位小图
 export async function listImages(zip) {
@@ -944,14 +967,14 @@ async function dropParts(zip, test) {
 
 // 正文类 XML：批注锚点、修订历史（接受全部）、隐藏文字、拼写标记
 function cleanDom(d) {
-  const q = (n) => [...d.getElementsByTagNameNS(NS, n)];
+  const q = (n) => [...d.getElementsByTagNameNS(NS.WORD, n)];
   for (const n of ['proofErr', 'commentRangeStart', 'commentRangeEnd', 'moveFromRangeStart', 'moveFromRangeEnd', 'moveToRangeStart', 'moveToRangeEnd',
     'rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange', 'tcPrChange', 'trPrChange', 'tblGridChange', 'tblPrExChange', 'numberingChange']) q(n).forEach((x) => x.remove());
   q('commentReference').forEach((x) => x.parentNode?.parentNode && x.parentNode.remove());
-  const gb = q('bookmarkStart').filter((x) => x.getAttributeNS(NS, 'name') === '_GoBack');
-  const ids = new Set(gb.map((x) => x.getAttributeNS(NS, 'id')));
+  const gb = q('bookmarkStart').filter((x) => x.getAttributeNS(NS.WORD, 'name') === '_GoBack');
+  const ids = new Set(gb.map((x) => x.getAttributeNS(NS.WORD, 'id')));
   gb.forEach((x) => x.remove());
-  q('bookmarkEnd').filter((x) => ids.has(x.getAttributeNS(NS, 'id'))).forEach((x) => x.remove());
+  q('bookmarkEnd').filter((x) => ids.has(x.getAttributeNS(NS.WORD, 'id'))).forEach((x) => x.remove());
   [...q('del'), ...q('moveFrom')].forEach((x) => x.remove());
   for (const x of [...q('ins'), ...q('moveTo')]) {
     if (!x.parentNode) continue;

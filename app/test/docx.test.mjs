@@ -289,6 +289,24 @@ test('结构标记 / 修订作者可经 opts 覆盖（投影工具与本项目�
   assert.ok(xml.includes('w:author="me"') && !xml.includes(TOOL_AUTHOR));
 });
 
+test('界面文字可经 opts.i18n 按组覆盖；自定义结构标记时 lines 按它分', async () => {
+  const { plainView } = await import('../src/plain.js');
+  const marks = makeMarks({ open: '[[表', openNote: '', close: '表]]' });
+  const d = await DocxProjection.load(await sample(MERGED), { marks, i18n: { parts: { header: 'Header', chart: 'Chart' } } });
+  assert.match(d.md, /^### Header header1$/m);
+  assert.match(d.md, /^### Chart chart1$/m);
+  assert.match(d.md, /^### 文本框$/m, '没覆盖的条目沿用默认');
+  assert.deepEqual(plainView(d.md, marks).lines.filter((l) => l.kind === 'open' || l.kind === 'close').map((l) => l.kind), ['open', 'close']);
+});
+
+test('载入时只撤掉同一作者以前写的修订', async () => {
+  const rev = (author) => p(`<w:ins w:id="1" w:author="${author}">${t('新增')}</w:ins><w:del w:id="2" w:author="${author}"><w:r><w:delText>旧文</w:delText></w:r></w:del>`);
+  const ours = await DocxProjection.load(await sample(rev(TOOL_AUTHOR)));
+  assert.match(ours.md, /^旧文$/m);
+  const theirs = await DocxProjection.load(await sample(rev('ss')));
+  assert.match(theirs.md, /^新增$/m);
+});
+
 test('公式 / 注音 / altChunk：不投影，按标签名列进未处理清单', async () => {
   const M = 'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"';
   const extra = p(`${t('面积')}<m:oMath ${M}><m:r><m:t>S=πr²</m:t></m:r></m:oMath>`)
