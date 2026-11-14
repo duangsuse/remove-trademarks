@@ -1,11 +1,11 @@
 // Word <-> Markdown 1:1 投影；差异以修订（w:del / w:ins）写回。三层：docx ⇄ md（本文件）⇄ txt（plain.js）
-// 用法：const d = await DocxProjection.load(buf, opts); d.md / d.text / d.anchor(i)；
-//       d.replace(spans) / d.applyText(newMd) / d.editText(fn, { range })；d.dropImages / d.wipe；await d.save()
+// 用法：const d = await DocxProjection.load(buf, opts); d.md / d.text / d.locate(i) / await d.media()；
+//       改动：d.splice(spans)（md 区间）/ d.diffMd(newMd)（整份 md）/ d.mapPlain(fn, { range })（纯文本）——都归到 splice；
+//       d.blankImages / d.wipeMetadata；await d.save({ revisions })
 // 不依赖脱敏逻辑；结构标记、修订作者的默认值来自 markup.js，界面文字见 I18N，都可经 opts 覆盖
 import JSZip from 'jszip';
-import { diffLines, diffChars } from 'diff';
 import { PROJECTION } from './markup.js';
-import { plainView, plainEdits, unmark, BR } from './plain.js';
+import { plainView, plainToSpans, diffSpans, BR } from './plain.js';
 
 const NS = {
   WORD: 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
@@ -49,6 +49,7 @@ const PLACEHOLDER = {
   bmp: 'Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAADEDgAAxA4AAAAAAAAAAAAAzc3NAA==',
   jpg: '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD02iiigD//2Q==',
 };
+const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp' };
 
 const isW = (n, name) => n.nodeType === 1 && n.namespaceURI === NS.WORD && n.localName === name;
@@ -161,12 +162,14 @@ function runFmt(r, style) {
 }
 
 // ---------- Markdown 构建 ----------
+// 每个 md 字符记：pid 所属单元、off 单元内原子位置、ed 可编辑、aft「紧跟这个字之后插入」落在单元内哪个位置
+// （可编辑字是 off + 1；不可编辑的原子如 <br> 也是 off + 1；它前面的标记、转义是 off，即插在原子之前）
 class MD {
-  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; this.imgs = []; }
-  push(str, pid, off, ed) { for (let i = 0; i < str.length; i++) { this.out.push(str[i]); this.pid.push(pid); this.off.push(off); this.ed.push(ed); } }
+  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; this.aft = []; this.imgs = []; }
+  push(str, pid, off, ed, aft = off + ed) { for (let i = 0; i < str.length; i++) { this.out.push(str[i]); this.pid.push(pid); this.off.push(off); this.ed.push(ed); this.aft.push(aft); } }
   s(str) { this.push(str, -1, 0, 0); }
-  sp(str, para, off) { this.push(str, para.idx, off, 0); }
-  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = n; this.imgs = this.imgs.filter((x) => x.e <= n); }
+  sp(str, para, off, aft = off) { this.push(str, para.idx, off, 0, aft); }
+  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = this.aft.length = n; this.imgs = this.imgs.filter((x) => x.e <= n); }
   get length() { return this.out.length; }
 }
 const marker = (f) => (f === 'bi' ? '***' : f === 'b' ? '**' : '*');
@@ -217,7 +220,7 @@ function emitPara(md, para, prefix = '', lineStart = false) {
     else if (a.edit) {
       if (ESC.has(a.ch)) md.sp('\\', para, i);
       md.push(a.ch, para.idx, i, 1);
-    } else md.sp(a.ch === '\n' ? '<br>' : a.ch, para, i);
+    } else md.sp(a.ch === '\n' ? '<br>' : a.ch, para, i, i + 1); // 软换行等不可编辑原子：紧跟其后插入的字落在它后面
   });
   if (fmt) md.sp(marker(fmt), para, atoms.length);
   if (link) closeLink(atoms.length);
@@ -289,6 +292,10 @@ const hasText = (el) => [...el.childNodes].some((c) => (c.nodeType === 3 ? c.dat
 // 插入文本里的 ![..](路径)：不是新增图片，而是移动（放回被删掉的同路径图片）或复制（克隆文档里已有的同路径图片）。文本里换成 OBJ，路径按顺序记进 refs，保存时再配对
 const OBJ = '\uFFFC';
 const IMG_TOKEN = /!\[(?:\\[\s\S]|[^\]\\])*\]\(([^\s)"]+)(?: "(?:\\[\s\S]|[^"\\])*")?\)/g;
+// diffMd 逐段比较时整张图片算一个词（不和别的图片逐字错配）；同一路径的才逐字比（改说明）
+const imgTokens = (s) => { const out = []; let p = 0; for (const m of s.matchAll(IMG_TOKEN)) { out.push(...s.slice(p, m.index), m[0]); p = m.index + m[0].length; } out.push(...s.slice(p)); return out; };
+const imgPath = (tok) => (tok.length > 1 && tok.startsWith('![') ? new RegExp(IMG_TOKEN.source).exec(tok)?.[1] : null);
+const IMG_DIFF = { tokens: imgTokens, same: (x, y) => imgPath(x) != null && imgPath(x) === imgPath(y) };
 class Edits extends Map {
   dropped = []; // 被整体删除的图片 { pid, off, path, part }，没被配对到插入处的就是真删除
   of(pid) { let e = this.get(pid); if (!e) this.set(pid, (e = { del: new Set(), ins: new Map(), drop: new Set(), refs: new Map(), nodes: new Map() })); return e; }
@@ -306,60 +313,26 @@ const coveredImgs = (images, a, b) => images.filter((x) => !x.locked && x.s >= a
 
 // md 位置 p 处插入：挂到前一个字之后，否则挂到后一个字之前；结构位置（不属于任何单元）返回 null
 function insertAnchor(map, p) {
-  if (p > 0 && map.pid[p - 1] >= 0) return [map.pid[p - 1], map.off[p - 1] + map.ed[p - 1]];
+  if (p > 0 && map.pid[p - 1] >= 0) return [map.pid[p - 1], map.aft[p - 1]];
   if (p < map.pid.length && map.pid[p] >= 0) return [map.pid[p], map.off[p]];
   return null;
 }
 
-// diff -> 每段编辑。newMap：新文本也是某个 docx 的投影时传入——插入文字只取其中「可编辑字符」，转义反斜杠 / 粗斜体标记 / 表格竖线 / 换行等结构字符不会混进来
-function computeEdits(origMd, newMd, map, newMap, edits, images = []) {
-  const stats = { del: 0, ins: 0, skipped: 0 };
-  const del = (a, b) => {
-    let any = false;
-    const gone = coveredImgs(images, a, b); // 整张图片被删：连说明文字一起不动（移动时说明文字要跟着走）
-    for (const x of gone) edits.dropObj(x);
-    for (let i = a; i < b; i++) if (map.pid[i] >= 0 && map.ed[i] && !gone.some((x) => i >= x.s && i < x.e)) { edits.del(map.pid[i], map.off[i]); any = true; }
-    if (any || gone.length) stats.del++; else stats.skipped++;
-  };
-  const ins = (p, text, np, raw) => {
-    if (newMap) { let t = ''; for (let i = 0; i < text.length; i++) if (newMap.ed[np + i]) t += text[i]; text = t; }
-    else text = (raw ? unmark(text).replaceAll(BR, '\n') : text).replace(/\r\n?/g, '\n');
-    if (!text) return;
-    const a = insertAnchor(map, p);
-    if (!a) { stats.skipped++; return; }
-    edits.ins(a[0], a[1], text);
-    stats.ins++;
-  };
-  if (origMd === newMd) return { stats };
-  const walkChars = (a, b, pos, np) => {
-    if (!b) { del(pos, pos + a.length); return; }
-    if (!a) { ins(pos, b, np); return; }
-    if (a.length * b.length > 4e6) { // 超长行：先去掉公共首尾，仍太长才整段替换（插入文字去掉 Markdown 标记）
-      let i = 0, j = 0;
-      while (i < a.length && i < b.length && a[i] === b[i]) i++;
-      while (j < a.length - i && j < b.length - i && a[a.length - 1 - j] === b[b.length - 1 - j]) j++;
-      a = a.slice(i, a.length - j); b = b.slice(i, b.length - j); pos += i; np += i;
-      if (!a || !b || a.length * b.length > 4e6) { if (a) del(pos, pos + a.length); if (b) ins(pos + a.length, b, np, true); return; }
+// diffMd 插入的文字只取新 md 里的「内容」：来自另一个投影时取它的可编辑字符和整张图片（图片是移动 / 复制），
+// 否则按纯文本投影去掉转义与粗斜体标记、<br> 换回换行（md 的换行是分段，不算内容）。返回 (at, n) -> 新 md [at, at + n) 里的内容
+function contentOf(newMd, from) {
+  const keep = new Array(newMd.length).fill('');
+  if (from) {
+    for (let i = 0; i < newMd.length; i++) if (from.ed[i]) keep[i] = newMd[i];
+    for (const x of from.images) for (let i = x.s; i < x.e; i++) keep[i] = newMd[i];
+  } else {
+    const v = plainView(newMd);
+    for (let k = 0; k < v.text.length; k++) {
+      const [ms, me] = v.toMd(k, k + 1), c = v.text[k];
+      if (c === BR) keep[ms] = '\n'; else if (c !== '\n') keep[me - 1] = c; // md 的换行是分段（结构），<br> 才是软换行
     }
-    for (const part of diffChars(a, b)) {
-      const n = part.value.length;
-      if (part.removed) { del(pos, pos + n); pos += n; }
-      else if (part.added) { ins(pos, part.value, np); np += n; }
-      else { pos += n; np += n; }
-    }
-  };
-  const parts = diffLines(origMd, newMd);
-  let pos = 0, np = 0;
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
-    if (p.removed) {
-      const nx = parts[i + 1];
-      if (nx && nx.added) { walkChars(p.value, nx.value, pos, np); pos += p.value.length; np += nx.value.length; i++; }
-      else { del(pos, pos + p.value.length); pos += p.value.length; }
-    } else if (p.added) { ins(pos, p.value, np); np += p.value.length; }
-    else { pos += p.value.length; np += p.value.length; }
   }
-  return { stats };
+  return (at, n) => keep.slice(at, at + n).join('').replace(/\r\n?/g, '\n');
 }
 
 // ---------- 写入修订 ----------
@@ -504,89 +477,109 @@ function maxId(parts) {
 
 // ---------- 投影 ----------
 export class DocxProjection {
-  opts = null; // { marks, author, i18n }
-  zip = null;
-  parts = new Map(); // path -> {path, doc, dirty}（含 .rels）
-  textParts = []; // 正文 + 页眉页脚脚注尾注
-  units = []; // 段落 {kind:'para', el, part, atoms} 或文本单元 {kind:'text', part, atoms, set}
   md = '';
   images = []; // 图片 / 图表 / SmartArt 在 md 里的整段 [{s, e, pid, off, path, part, locked}]
-  map = null; // md 每个字符 -> {pid 单元, off 单元内位置, ed 可编辑}
   warnings = [];
   unhandled = []; // 投影不了的元素 [{tag: 'm:oMath', count}]，也会汇总进 warnings
-  stats = { del: 0, ins: 0, skipped: 0 };
+  #opts = null; // { marks, author, i18n }
+  #zip = null;
+  #parts = new Map(); // path -> {path, doc, dirty}（含 .rels）
+  #textParts = []; // 正文 + 页眉页脚脚注尾注
+  #units = []; // 段落 {kind:'para', el, part, atoms} 或文本单元 {kind:'text', part, atoms, set}
+  #map = null; // md 每个字符 -> {pid 单元, off 单元内位置, ed 可编辑, aft 紧跟其后插入的位置}（见 MD）
+  #stats = { del: 0, ins: 0, skipped: 0 }; // 各次编辑累计，save 再按实际写入修正成 report
   #edits = new Edits();
   #mirrors = [];
-  #drop = [];
+  #blank = [];
   #wipe = false;
   #saved = false;
 
-  // opts（默认见 markup.js PROJECTION）：marks 结构标记（makeMarks）；author save({track}) 的修订作者，载入时先拒绝掉这个作者的修订；
+  // opts（默认见 markup.js PROJECTION）：marks 结构标记（makeMarks）；author save({revisions}) 的修订作者，载入时先拒绝掉这个作者的修订；
   // i18n 界面文字（见 I18N，按组覆盖）
   static async load(buffer, opts = {}) {
     const d = new DocxProjection();
-    d.opts = { ...PROJECTION, ...opts, i18n: mergeI18n(opts.i18n) };
+    d.#opts = { ...PROJECTION, ...opts, i18n: mergeI18n(opts.i18n) };
     await d.#load(buffer);
     return d;
   }
 
-  // md -> txt 投影（去掉转义与粗斜体标记），editText 的 fn 拿到的就是它（或其中一段）
-  get text() { return plainView(this.md, this.opts.marks).text; }
+  // md -> txt 投影（去掉转义与粗斜体标记），mapPlain 的 fn 拿到的就是它（或其中一段）
+  get text() { return plainView(this.md, this.#opts.marks).text; }
 
   // md 第 i 个字符对应的位置；结构字符（Markdown 标记、表格竖线等）editable 为 false
-  anchor(i) {
-    const pid = this.map.pid[i];
+  locate(i) {
+    const pid = this.#map.pid[i];
     if (pid == null || pid < 0) return null;
-    const unit = this.units[pid];
-    return { unit, atom: unit.atoms[this.map.off[i]] ?? null, editable: this.map.ed[i] === 1 };
+    const unit = this.#units[pid];
+    return { unit, atom: unit.atoms[this.#map.off[i]] ?? null, editable: this.#map.ed[i] === 1 };
   }
 
-  // 按 md 区间替换：区间内可编辑字符全删，text 插在第一个可编辑字符处（用被删字的格式）；s === e 为纯插入
-  replace(spans) {
-    const { pid, off, ed } = this.map, st = { del: 0, ins: 0, skipped: 0 };
+  // 三种编辑最终都走这里，返回本次的 {del, ins, skipped}。坐标都基于载入时的投影：多次调用在原文上叠加，后一次看不到前一次的结果
+
+  // 按 md 区间替换 [{s, e, text}]：区间内可编辑字符全删，text 插在第一个被删的字处、用它的格式；s === e 为纯插入
+  splice(spans) {
+    const map = this.#map, { pid, off, ed } = map, st = { del: 0, ins: 0, skipped: 0 };
     for (const { s, e, text = '' } of spans) {
-      if (s === e) {
-        const a = text && insertAnchor(this.map, s);
-        if (a) { this.#edits.ins(a[0], a[1], text); st.ins++; } else if (text) st.skipped++;
-        continue;
-      }
       let first = -1;
       const gone = coveredImgs(this.images, s, e);
       for (const x of gone) this.#edits.dropObj(x);
       for (let i = s; i < e; i++) if (ed[i] && !gone.some((x) => i >= x.s && i < x.e)) { if (first < 0) first = i; this.#edits.del(pid[i], off[i]); }
-      if (first < 0 && !gone.length) { st.skipped++; continue; }
-      st.del++;
-      const at = first >= 0 ? [pid[first], off[first]] : insertAnchor(this.map, s);
-      if (text && at) { this.#edits.ins(at[0], at[1], text); st.ins++; }
+      if (first >= 0 || gone.length) st.del++; else if (e > s) st.skipped++; // 只有结构字符：删不掉
+      if (!text) continue;
+      const at = first >= 0 ? [pid[first], off[first]] : insertAnchor(map, s);
+      if (at) { this.#edits.ins(at[0], at[1], text); st.ins++; } else st.skipped++;
     }
     return this.#count(st);
   }
 
-  // 与新 md 做 diff；from：新文本来自另一个 DocxProjection 时传入，结构字符不会写进正文
-  applyText(newMd, { from = null } = {}) {
-    return this.#count(computeEdits(this.md, newMd, this.map, from?.map, this.#edits, this.images).stats);
+  // 拿改过的整份 md 做 diff，差异作为区间替换交给 splice。from：新 md 来自另一个 DocxProjection 时传入，只取它的可编辑字符（和整张图片）
+  diffMd(newMd, { from = null } = {}) {
+    const content = contentOf(newMd, from && { ed: from.#map.ed, images: from.images });
+    const spans = [], st = { del: 0, ins: 0, skipped: 0 };
+    for (const x of diffSpans(this.md, newMd, IMG_DIFF)) {
+      const text = content(x.at, x.text.length);
+      if (x.text && !text && x.e === x.s) st.skipped++; // 只插入了结构字符（标记、换段等）
+      spans.push({ s: x.s, e: x.e, text });
+    }
+    this.#count(st);
+    const r = this.splice(spans);
+    r.skipped += st.skipped;
+    return r;
   }
 
-  // 用函数改纯文本投影：fn(text) -> 新 text，差异写回。range=[s, e]（md 坐标，如 lineRange(d.md, 11, 22)）时 fn 只拿到这一段。
-  // 坐标都基于载入时的投影：多次调用是在原文上叠加，不会看到前一次的结果
-  editText(fn, { range } = {}) {
-    return this.replace(plainEdits(this.md, fn, range, this.opts.marks));
+  // 用函数改纯文本投影：fn(text) -> 新 text，差异交给 splice。range=[s, e]（md 坐标，如 lineRange(d.md, 11, 22)）时 fn 只拿到这一段
+  mapPlain(fn, { range } = {}) {
+    return this.splice(plainToSpans(this.md, fn, range, this.#opts.marks));
   }
 
-  dropImages(paths) { this.#drop.push(...paths); return this; }
-  wipe() { this.#wipe = true; return this; }
+  // 媒体文件 word/media/*：[{path, name, ext, size, bytes, mime, replaceable, uses: [{s, e}]}]；replaceable 表示 blankImages 能换成占位小图。须在 save 之前调用
+  async media() {
+    const out = [], zip = this.#zip;
+    for (const path of Object.keys(zip.files)) {
+      const m = /^word\/media\/([^/]+)\.([A-Za-z0-9]+)$/.exec(path);
+      if (!m || zip.files[path].dir) continue;
+      const ext = m[2].toLowerCase(), bytes = await zip.file(path).async('uint8array'), mime = MIME[ext] || '';
+      const uses = this.images.filter((x) => 'word/' + x.path === path).map(({ s, e }) => ({ s, e }));
+      out.push({ path, name: m[1] + '.' + ext, ext, size: bytes.length, bytes, mime, replaceable: !!mime, uses });
+    }
+    return out.sort((a, b) => a.path.localeCompare(b.path, 'en', { numeric: true }));
+  }
 
-  // track：写成审阅修订（作者 author）；type 同 JSZip.generateAsync。DOM 会被改写，只能调用一次
-  async save({ track = false, author = this.opts.author, type = 'blob' } = {}) {
-    if (this.#saved) throw new Error(this.opts.i18n.warn.savedTwice);
+  blankImages(paths) { this.#blank.push(...paths); return this; } // 换成 1×1 占位图
+  wipeMetadata() { this.#wipe = true; return this; } // 抹掉作者、批注、修订记录、rsid 等不可见指纹
+
+  // revisions：写成审阅修订（作者 author）；type 同 JSZip.generateAsync。DOM 会被改写，只能调用一次。
+  // 返回 { blob | data, report: {del, ins, skipped}（按实际写入修正过的累计数）, warnings }
+  async save({ revisions = false, author = this.#opts.author, type = 'blob' } = {}) {
+    if (this.#saved) throw new Error(this.#opts.i18n.warn.savedTwice);
     this.#saved = true;
-    const warnings = [...this.warnings], stats = { ...this.stats }, t = this.opts.i18n;
-    const ctx = { author, date: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), nextId: maxId(this.textParts) + 1, track };
+    const warnings = [...this.warnings], stats = { ...this.#stats }, t = this.#opts.i18n, track = revisions;
+    const ctx = { author, date: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), nextId: maxId(this.#textParts) + 1, track };
     const edited = [], mirror = new Map();
     let untracked = 0, failed = 0;
     const added = this.#pairImages(ctx);
     for (const [pid, ed] of this.#edits) {
-      const u = this.units[pid];
+      const u = this.#units[pid];
       if (u.kind === 'text') {
         if (track) { untracked++; continue; } // 属性 / 关系里的文字没有修订语法，写了就清不掉
         const v = applyTextEdits(u, ed);
@@ -610,40 +603,40 @@ export class DocxProjection {
     syncFallbacks(edited);
     const miss = mirror.size ? mirrorSmartArt(this.#mirrors, mirror) : 0;
     if (miss) warnings.push(t.warn.smartArt(miss));
-    const wiped = new Set(this.#wipe ? this.textParts : []);
+    const wiped = new Set(this.#wipe ? this.#textParts : []);
     for (const part of wiped) cleanDom(part.doc);
-    for (const part of this.parts.values()) {
+    for (const part of this.#parts.values()) {
       if (!part || !(part.dirty || wiped.has(part))) continue;
       let xml = new XMLSerializer().serializeToString(part.doc);
       if (wiped.has(part)) xml = xml.replace(FP_ATTR, '');
-      this.zip.file(part.path, /^<\?xml/.test(xml) ? xml : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + xml);
+      this.#zip.file(part.path, /^<\?xml/.test(xml) ? xml : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + xml);
     }
-    for (const path of this.#drop) {
+    for (const path of this.#blank) {
       const ext = path.split('.').pop().toLowerCase();
       const key = ext === 'jpeg' ? 'jpg' : ext;
-      if (PLACEHOLDER[key] && this.zip.file(path)) this.zip.file(path, b64(PLACEHOLDER[key]));
+      if (PLACEHOLDER[key] && this.#zip.file(path)) this.#zip.file(path, b64(PLACEHOLDER[key]));
     }
-    if (this.#wipe) await wipeFingerprints(this.zip);
-    const out = await this.zip.generateAsync({ type, compression: 'DEFLATE', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
-    return { [type === 'blob' ? 'blob' : 'data']: out, stats, warnings };
+    if (this.#wipe) await wipeParts(this.#zip);
+    const out = await this.#zip.generateAsync({ type, compression: 'DEFLATE', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+    return { [type === 'blob' ? 'blob' : 'data']: out, report: stats, warnings };
   }
 
   // 插入文本里的图片引用：优先配对到被删掉的同路径图片（同一部件内，按出现顺序）= 移动；
   // 没有可配的就复制文档里已有的同路径图片（关系 / 媒体文件现成，克隆 drawing 即可）；都没有的是新增，忽略。返回被忽略的个数。没被放回的被删图片就是真删除
   #pairImages(ctx) {
     const objRun = (img) => {
-      const a = this.units[img.pid].atoms[img.off], r = a.r.cloneNode(false), rpr = kid(a.r, 'rPr');
+      const a = this.#units[img.pid].atoms[img.off], r = a.r.cloneNode(false), rpr = kid(a.r, 'rPr');
       if (rpr) r.appendChild(rpr.cloneNode(true));
       r.appendChild(a.item.cloneNode(true));
       return r;
     };
     const gone = this.#edits.dropped.map((img) => ({ img, r: objRun(img), used: false }));
     let ignored = 0, docPr = 0; // wp:docPr 的 id（与 w:id 是两套编号）
-    for (const part of this.textParts) for (const el of part.doc.getElementsByTagNameNS(NS.WP, 'docPr')) docPr = Math.max(docPr, +el.getAttribute('id') || 0);
+    for (const part of this.#textParts) for (const el of part.doc.getElementsByTagNameNS(NS.WP, 'docPr')) docPr = Math.max(docPr, +el.getAttribute('id') || 0);
     const renew = (r) => { for (const el of r.getElementsByTagNameNS(NS.WP, 'docPr')) el.setAttribute('id', String(++docPr)); };
     for (const [pid, ed] of this.#edits) {
       for (const [at, paths] of ed.refs) {
-        const u = this.units[pid], nodes = [];
+        const u = this.#units[pid], nodes = [];
         for (const path of paths) {
           const same = (x) => x.path === path && x.part === u.part;
           const move = u.kind === 'para' && gone.find((x) => !x.used && same(x.img));
@@ -658,11 +651,11 @@ export class DocxProjection {
     return ignored;
   }
 
-  #count(st) { for (const k in st) this.stats[k] += st[k]; return st; }
+  #count(st) { for (const k in st) this.#stats[k] += st[k]; return st; }
 
   async #load(buffer) {
-    const zip = (this.zip = await JSZip.loadAsync(buffer));
-    const { parts, warnings, units } = this, { marks, author, i18n: t } = this.opts;
+    const zip = (this.#zip = await JSZip.loadAsync(buffer));
+    const { warnings } = this, parts = this.#parts, units = this.#units, { marks, author, i18n: t } = this.#opts;
     const load = async (path) => {
       if (!path) return null;
       if (!parts.has(path)) { const doc = await loadXml(zip, path, (p) => warnings.push(t.warn.parseFailed(p))); parts.set(path, doc ? { path, doc, dirty: false } : null); }
@@ -688,8 +681,8 @@ export class DocxProjection {
     const lists = new Lists((await load(ofType('numbering')[0]))?.doc, style);
     const others = [];
     for (const type of TEXT_PARTS) for (const p of ofType(type)) { const part = await load(p); if (part) others.push({ type, part }); }
-    this.textParts = [main, ...others.map((o) => o.part)].filter(Boolean);
-    for (const part of this.textParts) { await rels(part.path); if (rejectOurs(part.doc, author)) part.dirty = true; }
+    this.#textParts = [main, ...others.map((o) => o.part)].filter(Boolean);
+    for (const part of this.#textParts) { await rels(part.path); if (rejectOurs(part.doc, author)) part.dirty = true; }
 
     const unit = (u) => { u.idx = units.length; units.push(u); return u; };
     const textUnit = (part, text, set, extra) => unit({ kind: 'text', part, atoms: [...text].map((ch) => ({ ch, edit: true })), set, ...extra });
@@ -916,26 +909,11 @@ export class DocxProjection {
 
     this.images = md.imgs;
     this.md = md.out.join('');
-    this.map = { pid: Int32Array.from(md.pid), off: Int32Array.from(md.off), ed: Uint8Array.from(md.ed) };
+    this.#map = { pid: Int32Array.from(md.pid), off: Int32Array.from(md.off), ed: Uint8Array.from(md.ed), aft: Int32Array.from(md.aft) };
   }
 }
 
 // ---------- 图片 / 不可见元素 ----------
-const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-
-// word/media/* 与 docProps/thumbnail.*；replaceable 表示本工具能换成占位小图
-export async function listImages(zip) {
-  const out = [];
-  for (const path of Object.keys(zip.files)) {
-    const m = /^word\/media\/([^/]+)\.([A-Za-z0-9]+)$/.exec(path);
-    if (!m || zip.files[path].dir) continue;
-    const ext = m[2].toLowerCase();
-    const bytes = await zip.file(path).async('uint8array');
-    const mime = MIME[ext];
-    out.push({ path, name: m[1] + '.' + ext, ext, size: bytes.length, replaceable: !!mime, url: mime ? URL.createObjectURL(new Blob([bytes], { type: mime })) : '' });
-  }
-  return out.sort((a, b) => a.path.localeCompare(b.path, 'en', { numeric: true }));
-}
 
 // ---------- 不可见指纹抹除：只留正文、格式和图片 ----------
 // 参考微软「检查文档」可删除的隐藏数据和个人信息：文档属性/作者、批注、修订、隐藏文字、自定义 XML、缩略图、会话 ID(rsid/paraId) 等
@@ -985,7 +963,7 @@ function cleanDom(d) {
   q('r').filter((r) => { const p = kid(r, 'rPr'); return p && on(kid(p, 'vanish')); }).forEach((r) => r.remove());
 }
 
-async function wipeFingerprints(zip) {
+async function wipeParts(zip) {
   await dropParts(zip, (p) => FP_PARTS.some((re) => re.test(p)));
   if (zip.file('docProps/core.xml')) zip.file('docProps/core.xml', MIN_CORE);
   if (zip.file('docProps/app.xml')) zip.file('docProps/app.xml', MIN_APP);

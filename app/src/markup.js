@@ -1,4 +1,4 @@
-// Markdown 投影的结构：docx.js 用 makeMarks 的 dump 部分写，detect.js / main.js 用 readLines 读。结构只在这里定义一次
+// Markdown 投影的结构：docx.js 用 makeMarks 的 dump 部分写，detect.js / main.js 用 mdLines 读。结构只在这里定义一次
 const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // 特殊表格（合并单元格等，1 格 1 行）夹在 open / close 两行之间；others 之后是页眉页脚 / 脚注 / 文本框 / 图表，每节以 section 开头
@@ -27,7 +27,7 @@ export const PROJECTION = { marks: MARK, author: '脱敏助手' };
 // load：逐行标出结构 [{text, s, n, kind, others}]。n 从 1 起；others 为真表示已在「其他文本」区。
 // kind：open / close（特殊表格边界）、cell（特殊表格里的行）、table / tableSep（普通表格行 / 分隔行）、rule（---）、text。
 // structural：不是正文的行（不送 NER、不当章节）
-export function readLines(text, m = MARK) {
+export function mdLines(text, m = MARK) {
   const cut = text.indexOf('\n' + m.others), out = [];
   let s = 0, n = 0, special = false;
   for (const line of text.split('\n')) {
@@ -46,7 +46,7 @@ export function readLines(text, m = MARK) {
 
 // 特殊表格的开头行与收尾行互为另一头：[s, e] 落在其中一行内时返回另一头的行首位置，否则 -1
 export function partnerOf(text, s, e = s, m = MARK) {
-  const lines = readLines(text, m), i = lines.findLastIndex((l) => l.s <= s), l = lines[i];
+  const lines = mdLines(text, m), i = lines.findLastIndex((l) => l.s <= s), l = lines[i];
   if (!l || e > l.s + l.text.length) return -1;
   if (l.kind === 'open') return lines.slice(i + 1).find((x) => x.kind === 'close')?.s ?? -1;
   if (l.kind === 'close') return lines.slice(0, i).findLast((x) => x.kind === 'open')?.s ?? -1;

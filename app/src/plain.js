@@ -1,7 +1,7 @@
 // md -> txt 投影：去掉转义反斜杠、粗斜体 * 后的纯文字，带回 md 坐标的映射。
 // 规则 / 黑名单 / NER 都在纯文本上匹配（「张**三**」也能命中「张三」），命中区间再换回 md 坐标（中间的标记一并包进去）
-import { diffLines, diffChars } from 'diff';
-import { readLines, MARK } from './markup.js';
+import { diffLines, diffChars, diffArrays } from 'diff';
+import { mdLines, MARK } from './markup.js';
 
 // 单元格内换行在 md 里写作 <br>，纯文本里是 1 个字符：不能是 \n（会让纯文本行号与 md 对不上），用行分隔符，\s 能匹配、. 不跨它
 export const BR = '\u2028';
@@ -9,7 +9,7 @@ export const BR = '\u2028';
 // 去掉 Markdown 标记（转义反斜杠、粗斜体 *）后的文字，像 innerText
 export const unmark = (s) => s.replace(/\\([\s\S])|\*+|<br>/g, (m, c) => (m === '<br>' ? BR : c ?? ''));
 
-// text：纯文字；lines：逐行结构（readLines，按 md 判定再换成纯文本坐标——转义掉的 | / --- 等不会被当成结构）；toMd(s, e)：纯文本区间 -> md 区间；at(pos)：md 位置 -> 纯文本位置；slice(s, e)：md 区间 -> 纯文字
+// text：纯文字；lines：逐行结构（mdLines，按 md 判定再换成纯文本坐标——转义掉的 | / --- 等不会被当成结构）；toMd(s, e)：纯文本区间 -> md 区间；fromMd(pos)：md 位置 -> 纯文本位置
 // marks：投影用的结构标记（DocxProjection 的 opts.marks），决定 lines 怎么分
 let viewOf = { md: null, marks: null, v: null };
 export function plainView(md, marks = MARK) {
@@ -23,18 +23,18 @@ export function plainView(md, marks = MARK) {
   }
   const n = out.length;
   idx[n] = md.length;
-  const at = (pos) => { let a = 0, b = n; while (a < b) { const m = (a + b) >> 1; if (idx[m] < pos) a = m + 1; else b = m; } return a; };
+  const fromMd = (pos) => { let a = 0, b = n; while (a < b) { const m = (a + b) >> 1; if (idx[m] < pos) a = m + 1; else b = m; } return a; };
   const v = {
     text: out.join(''),
-    get lines() { return (this._lines ||= readLines(md, marks).map((l) => { const s = at(l.s); return { ...l, s, text: this.text.slice(s, at(l.s + l.text.length)) }; })); },
+    get lines() { return (this._lines ||= mdLines(md, marks).map((l) => { const s = fromMd(l.s); return { ...l, s, text: this.text.slice(s, fromMd(l.s + l.text.length)) }; })); },
     toMd: (s, e) => [idx[s] - esc[s], e > s ? end[e - 1] : idx[s] - esc[s]], // 以转义字符开头时连反斜杠一起
-    at,
-    slice: (s, e) => v.text.slice(at(s), at(e)),
+    fromMd,
   };
   viewOf = { md, marks, v };
   return v;
 }
-export const plainOf = (md, s, e) => plainView(md).slice(s, e);
+// md 区间 -> 纯文字
+export const plainOf = (md, s, e) => { const v = plainView(md); return v.text.slice(v.fromMd(s), v.fromMd(e)); };
 
 // 对 md 应用区间替换 [{s, e, text}]（已按 s 排序、不重叠）。区间里的粗斜体标记原样留下，
 // 否则「张**三**」命中「张**三」时会剩下落单的 **
@@ -52,36 +52,57 @@ export function lineRange(md, a, b = a) {
   return [s, Math.max(s, e)];
 }
 
-// a -> b 的差异，作为 a 上的区间替换 [{s, e, text}]（先按行再按字，超长文本也不慢）
-export function textDiff(a, b) {
+// a -> b 的差异，作为 a 上的区间替换 [{s, e, text, at}]：at 是 text 在 b 里的起点；相邻的删除 + 插入合成一段替换。
+// 先按行再按字；超长的改动段先去掉公共首尾，仍太长就整段替换。
+// tokens(s)：把改动段切成词（如整张图片一个词）再比，默认逐字；same(x, y)：一删一插的两个词还能逐字比（如同一张图片只改了说明）
+export function diffSpans(a, b, { tokens = null, same = () => false } = {}) {
   const out = [];
-  const put = (s, e, text) => { const l = out.at(-1); if (l && l.e === s) { l.e = e; l.text += text; } else if (e > s || text) out.push({ s, e, text }); };
-  let pos = 0;
+  let pos = 0, bp = 0;
+  const put = (s, e, text) => { const l = out.at(-1); if (l && l.e === s) { l.e = e; l.text += text; } else if (e > s || text) out.push({ s, e, text, at: bp }); };
+  const del = (n) => { put(pos, pos + n, ''); pos += n; };
+  const ins = (t) => { put(pos, pos, t); bp += t.length; };
   const chars = (x, y) => {
-    for (const p of diffChars(x, y)) {
-      if (p.added) put(pos, pos, p.value);
-      else if (p.removed) { put(pos, pos + p.value.length, ''); pos += p.value.length; }
-      else pos += p.value.length;
+    if (x.length * y.length > 4e6) {
+      let i = 0, j = 0;
+      while (i < x.length && i < y.length && x[i] === y[i]) i++;
+      while (j < x.length - i && j < y.length - i && x[x.length - 1 - j] === y[y.length - 1 - j]) j++;
+      pos += i; bp += i;
+      x = x.slice(i, x.length - j); y = y.slice(i, y.length - j);
+      if (x.length * y.length > 4e6) { if (x) del(x.length); if (y) ins(y); pos += j; bp += j; return; }
+      chars(x, y); pos += j; bp += j; return;
     }
+    if (!tokens) { walk(diffChars(x, y).map((p) => ({ ...p, value: [p.value] }))); return; }
+    walk(diffArrays(tokens(x), tokens(y)), (r, d) => r.length === 1 && d.length === 1 && same(r[0], d[0]) && (byChar(r[0], d[0]), true));
   };
+  const byChar = (x, y) => walk(diffChars(x, y).map((p) => ({ ...p, value: [p.value] })));
+  // parts 的 value 是词数组；refine(删的词, 插的词) 返回真表示已自行处理
+  function walk(parts, refine) {
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i], v = p.value.join('');
+      if (refine && p.removed && parts[i + 1]?.added && refine(p.value, parts[i + 1].value)) { i++; continue; }
+      if (p.added) ins(v);
+      else if (p.removed) del(v.length);
+      else { pos += v.length; bp += v.length; }
+    }
+  }
   const parts = diffLines(a, b);
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i], nx = parts[i + 1];
     if (p.removed && nx?.added) { chars(p.value, nx.value); i++; }
-    else if (p.added) put(pos, pos, p.value);
-    else if (p.removed) { put(pos, pos + p.value.length, ''); pos += p.value.length; }
-    else pos += p.value.length;
+    else if (p.added) ins(p.value);
+    else if (p.removed) del(p.value.length);
+    else { pos += p.value.length; bp += p.value.length; }
   }
   return out;
 }
 
-// 用函数编辑纯文本投影：fn(纯文字) -> 新纯文字，差异换回 md 区间 [{s, e, text}]（交给 DocxProjection.replace）。
+// 用函数编辑纯文本投影：fn(纯文字) -> 新纯文字，差异换回 md 区间 [{s, e, text}]（交给 DocxProjection.splice）。
 // range=[s, e]（md 坐标，如选区或 lineRange）时只把这一段交给 fn
-export function plainEdits(md, fn, range = [0, md.length], marks = MARK) {
-  const v = plainView(md, marks), a = v.at(range[0]), b = v.at(range[1]);
+export function plainToSpans(md, fn, range = [0, md.length], marks = MARK) {
+  const v = plainView(md, marks), a = v.fromMd(range[0]), b = v.fromMd(range[1]);
   const before = v.text.slice(a, b), after = fn(before);
-  if (typeof after !== 'string') throw new TypeError('editText：fn 须返回字符串');
-  return textDiff(before, after).map(({ s, e, text }) => {
+  if (typeof after !== 'string') throw new TypeError('mapPlain：fn 须返回字符串');
+  return diffSpans(before, after).map(({ s, e, text }) => {
     const [ms, me] = v.toMd(a + s, a + e);
     return { s: ms, e: me, text };
   });

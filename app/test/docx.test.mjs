@@ -82,8 +82,8 @@ test('投影：标题样式、编号、链接、图片、图表、文本框、�
   assert.match(md, /\| a\\\|b \| x\\\*y \|/);
   assert.deepEqual(d.warnings, []);
   const i = md.indexOf('mailto:') + 7;
-  assert.equal(d.anchor(i).unit.kind, 'text');
-  assert.equal(d.anchor(md.indexOf('](mailto')).editable, false);
+  assert.equal(d.locate(i).unit.kind, 'text');
+  assert.equal(d.locate(md.indexOf('](mailto')).editable, false);
 });
 
 test('扫描在纯文本视图上：跨粗体也能命中，区间换回 md 坐标', async () => {
@@ -100,7 +100,7 @@ test('区间替换：所有位置（含链接地址、图片说明、图表、VM
   const d = await DocxProjection.load(buf);
   const items = scan(d.md, st(['张三', 'zhangsan']));
   const sel = selection([...items.values()], () => true);
-  const stats = d.replace(sel.map((x) => ({ ...x, text: 'XX' })));
+  const stats = d.splice(sel.map((x) => ({ ...x, text: 'XX' })));
   assert.equal(stats.skipped, 0);
   const { data, warnings } = await d.save({ type: 'uint8array' });
   assert.deepEqual(warnings, []);
@@ -115,7 +115,7 @@ test('区间替换：所有位置（含链接地址、图片说明、图表、VM
 test('替换文字沿用被删字的格式', async () => {
   const d = await DocxProjection.load(await sample());
   const s = d.md.indexOf('**三**') + 2;
-  d.replace([{ s, e: s + 1, text: '某' }]);
+  d.splice([{ s, e: s + 1, text: '某' }]);
   const d2 = await DocxProjection.load((await d.save({ type: 'uint8array' })).data);
   assert.match(d2.md, /联系人：张\*\*某\*\*，/);
 });
@@ -124,21 +124,21 @@ test('审阅修订：写入后重新载入与原文一致，重复写入不叠�
   const buf = await sample();
   const a0 = await DocxProjection.load(buf);
   const b = await DocxProjection.load(buf);
-  b.replace(selection([...scan(b.md, st(['张三'])).values()], () => true).map((x) => ({ ...x, text: '某' })));
+  b.splice(selection([...scan(b.md, st(['张三'])).values()], () => true).map((x) => ({ ...x, text: '某' })));
   const bData = (await b.save({ type: 'uint8array' })).data;
   const bp = await DocxProjection.load(bData);
   const a = await DocxProjection.load(buf);
-  const stats = a.applyText(bp.md, { from: bp });
+  const stats = a.diffMd(bp.md, { from: bp });
   assert.ok(stats.del && stats.ins);
-  const { data, warnings } = await a.save({ track: true, type: 'uint8array' });
+  const { data, warnings } = await a.save({ revisions: true, type: 'uint8array' });
   assert.ok(warnings.some((w) => /无法写成修订/.test(w)), '链接 / 图表文字不写成修订');
   const xml = await allText(data);
   assert.ok(xml.includes(`w:author="${TOOL_AUTHOR}"`));
   const again = await DocxProjection.load(data);
   assert.equal(again.md, a0.md, '载入时撤掉本工具的修订，投影回到原文');
   const a2 = await DocxProjection.load(data);
-  a2.applyText(bp.md, { from: bp });
-  const data2 = (await a2.save({ track: true, type: 'uint8array' })).data;
+  a2.diffMd(bp.md, { from: bp });
+  const data2 = (await a2.save({ revisions: true, type: 'uint8array' })).data;
   assert.equal((await allText(data2)).split(`w:author="${TOOL_AUTHOR}"`).length, xml.split(`w:author="${TOOL_AUTHOR}"`).length);
 });
 
@@ -165,7 +165,7 @@ test('区间替换：以转义字符开头的命中写入 docx 后不留反斜�
   const d = await DocxProjection.load(await sample());
   const sel = selection([scan(d.md, st(['|b'])).get('bl:|b')], () => true);
   assert.equal(sel.length, 1);
-  assert.equal(d.replace(sel.map((x) => ({ ...x, text: 'Z' }))).skipped, 0);
+  assert.equal(d.splice(sel.map((x) => ({ ...x, text: 'Z' }))).skipped, 0);
   const d2 = await DocxProjection.load((await d.save({ type: 'uint8array' })).data);
   assert.match(d2.md, /\| aZ \| x\\\*y \|/);
 });
@@ -206,8 +206,8 @@ test('样例申报书：标题按样式识别，替换后可再解析', { skip: 
   assert.ok(heads.length >= 40, `识别到 ${heads.length} 个样式标题`);
   const items = scan(d.md, { ...st([]), cats: {} });
   const sel = selection([...items.values()], () => true);
-  d.replace(sel.map((x) => ({ ...x, text: '**' })));
-  const { data, stats, warnings } = await d.save({ type: 'uint8array' });
+  d.splice(sel.map((x) => ({ ...x, text: '**' })));
+  const { data, report: stats, warnings } = await d.save({ type: 'uint8array' });
   console.log('样例：', sel.length, '处', stats, warnings);
   const d2 = await DocxProjection.load(data);
   assert.ok(d2.md.length > 1000);
@@ -220,7 +220,7 @@ test('editText：用函数改纯文本投影，保存后重新解析，纯文本
   const d = await DocxProjection.load(await sample());
   const fn = (s) => s.replaceAll('张三', '李四');
   const want = fn(d.text);
-  const st = d.editText(fn);
+  const st = d.mapPlain(fn);
   assert.equal(st.skipped, 0);
   const d2 = await roundTrip(d);
   assert.equal(d2.text, want);
@@ -229,7 +229,7 @@ test('editText：用函数改纯文本投影，保存后重新解析，纯文本
 
 test('editText：纯插入、纯删除', async () => {
   const d = await DocxProjection.load(await sample());
-  d.editText((s) => s.replace('联系人：', '联系人（已核实）：').replace('，电话 13912345678', ''));
+  d.mapPlain((s) => s.replace('联系人：', '联系人（已核实）：').replace('，电话 13912345678', ''));
   const d2 = await roundTrip(d);
   assert.match(d2.md, /^联系人（已核实）：张\*\*三\*\*$/m);
 });
@@ -237,7 +237,7 @@ test('editText：纯插入、纯删除', async () => {
 test('editText range：只改选区（第 n 行），其余行不动', async () => {
   const d = await DocxProjection.load(await sample());
   const lines = d.md.split('\n'), n = lines.findIndex((l) => l.startsWith('联系人')) + 1;
-  d.editText((s) => s.replaceAll('张', '某'), { range: lineRange(d.md, n) });
+  d.mapPlain((s) => s.replaceAll('张', '某'), { range: lineRange(d.md, n) });
   const d2 = await roundTrip(d);
   assert.match(d2.md, /^联系人：某\*\*三\*\*/m);
   assert.match(d2.md, /写信给张三/, '选区外不改');
@@ -246,7 +246,7 @@ test('editText range：只改选区（第 n 行），其余行不动', async () 
 test('applyText：改过的 md 写回（如外部编辑器改完的 .md 文件）', async () => {
   const d = await DocxProjection.load(await sample());
   const edited = d.md.replace('第一项', '第 1 项').replace('页眉 张三', '页眉');
-  d.applyText(edited);
+  d.diffMd(edited);
   const d2 = await roundTrip(d);
   assert.equal(d2.md, edited);
 });
@@ -254,8 +254,8 @@ test('applyText：改过的 md 写回（如外部编辑器改完的 .md 文件�
 test('审阅修订 round-trip：track 写入后重新载入先撤掉自己的修订，投影回到原文', async () => {
   const buf = await sample();
   const d = await DocxProjection.load(buf);
-  d.editText((s) => s.replace('第一项', '第二项'));
-  const again = await roundTrip(d, { track: true });
+  d.mapPlain((s) => s.replace('第一项', '第二项'));
+  const again = await roundTrip(d, { revisions: true });
   assert.equal(again.md, (await DocxProjection.load(buf)).md);
 });
 
@@ -284,8 +284,8 @@ test('结构标记 / 修订作者可经 opts 覆盖（投影工具与本项目�
   const d = await DocxProjection.load(await sample(MERGED), { marks, author: 'me' });
   assert.match(d.md, /^\[\[表\n基本信息\n联系人\n王五\n表\]\]$/m);
   assert.match(d.md, /^## 附\n\n### 页眉/m);
-  d.editText((s) => s.replace('王五', '某'));
-  const xml = await allText((await d.save({ track: true, type: 'uint8array' })).data);
+  d.mapPlain((s) => s.replace('王五', '某'));
+  const xml = await allText((await d.save({ revisions: true, type: 'uint8array' })).data);
   assert.ok(xml.includes('w:author="me"') && !xml.includes(TOOL_AUTHOR));
 });
 
@@ -356,13 +356,13 @@ test('制表符可编辑：删除、插入，审阅模式下是删除线 / 插�
   const d = await DocxProjection.load(await tabSample());
   assert.ok(d.md.includes('姓名\t张三'.replace(' ', '')));
   const i = d.md.indexOf('姓名\t') + 2;
-  assert.equal(d.anchor(i).editable, true);
-  d.replace([{ s: i, e: i + 1, text: '：' }, { s: d.md.indexOf('末尾'), e: d.md.indexOf('末尾'), text: '\t' }]);
+  assert.equal(d.locate(i).editable, true);
+  d.splice([{ s: i, e: i + 1, text: '：' }, { s: d.md.indexOf('末尾'), e: d.md.indexOf('末尾'), text: '\t' }]);
   const d2 = await roundTrip(d);
   assert.ok(d2.md.includes('姓名：张三') && d2.md.includes('\t末尾'));
   const e = await DocxProjection.load(await tabSample());
-  e.replace([{ s: i, e: i + 1, text: '' }]);
-  const { data } = await e.save({ type: 'uint8array', track: true });
+  e.splice([{ s: i, e: i + 1, text: '' }]);
+  const { data } = await e.save({ type: 'uint8array', revisions: true });
   const xml = await (await JSZip.loadAsync(data)).file('word/document.xml').async('string');
   assert.match(xml, /<w:del [^>]*><w:r><w:tab\/><\/w:r><\/w:del>/);
   assert.ok((await DocxProjection.load(data)).md.includes('姓名\t张三'), '重新载入先撤销自己的修订');
@@ -373,14 +373,14 @@ test('图片：整段删除、移动、复制，不能凭空新增', async () =>
   const media = (xml) => (xml.match(/r:embed="rI"/g) || []).length;
   // 删除
   let d = await DocxProjection.load(buf);
-  d.applyText(d.md.replace(imgTok + '\n', '\n'));
+  d.diffMd(d.md.replace(imgTok + '\n', '\n'));
   let { data, warnings } = await d.save({ type: 'uint8array' });
   assert.deepEqual(warnings, []);
   assert.equal(media(await (await JSZip.loadAsync(data)).file('word/document.xml').async('string')), 0);
   assert.doesNotMatch((await DocxProjection.load(data)).md, /image1\.png/);
   // 移动（alt 跟着走）：从原处剪切，贴到「末尾」行
   d = await DocxProjection.load(buf);
-  d.applyText(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok));
+  d.diffMd(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok));
   ({ data, warnings } = await d.save({ type: 'uint8array' }));
   assert.deepEqual(warnings, []);
   const md2 = (await DocxProjection.load(data)).md;
@@ -388,7 +388,7 @@ test('图片：整段删除、移动、复制，不能凭空新增', async () =>
   assert.ok(md2.includes('末尾' + imgTok));
   // 复制：原图不动，多出一张（同一媒体文件，docPr id 不重复）
   d = await DocxProjection.load(buf);
-  d.applyText(d.md.replace('末尾', '末尾' + imgTok));
+  d.diffMd(d.md.replace('末尾', '末尾' + imgTok));
   ({ data, warnings } = await d.save({ type: 'uint8array' }));
   assert.deepEqual(warnings, []);
   assert.equal((await DocxProjection.load(data)).md.split(imgTok).length, 3, '两张');
@@ -398,13 +398,13 @@ test('图片：整段删除、移动、复制，不能凭空新增', async () =>
   assert.equal(new Set(dids).size, dids.length, 'docPr id 不重复');
   // 一删一贴两份：第一份是移动、第二份是复制
   d = await DocxProjection.load(buf);
-  d.applyText(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok + imgTok));
+  d.diffMd(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok + imgTok));
   ({ data, warnings } = await d.save({ type: 'uint8array' }));
   assert.deepEqual(warnings, []);
   assert.equal((await DocxProjection.load(data)).md.split(imgTok).length, 3);
   // 凭空写一个：同样忽略
   d = await DocxProjection.load(buf);
-  d.applyText(d.md.replace('末尾', '末尾![x](media/other.png)'));
+  d.diffMd(d.md.replace('末尾', '末尾![x](media/other.png)'));
   ({ data, warnings } = await d.save({ type: 'uint8array' }));
   assert.match(warnings.join(), /新增图片被忽略/);
   assert.doesNotMatch((await DocxProjection.load(data)).md, /other\.png/);
@@ -413,8 +413,8 @@ test('图片：整段删除、移动、复制，不能凭空新增', async () =>
 test('图片：审阅模式下删除是删除线、移动的副本换新 id；整行删除会带走图片', async () => {
   const buf = await tabSample();
   let d = await DocxProjection.load(buf);
-  d.applyText(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok));
-  let { data } = await d.save({ type: 'uint8array', track: true });
+  d.diffMd(d.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok));
+  let { data } = await d.save({ type: 'uint8array', revisions: true });
   const xml = await (await JSZip.loadAsync(data)).file('word/document.xml').async('string');
   assert.match(xml, /<w:del [^>]*><w:r><w:drawing>/);
   assert.match(xml, /<w:ins [^>]*><w:r><w:drawing>/);
@@ -423,8 +423,88 @@ test('图片：审阅模式下删除是删除线、移动的副本换新 id；�
   assert.equal((await DocxProjection.load(data)).md.split(imgTok).length, 2);
   d = await DocxProjection.load(buf);
   const n = d.md.split('\n').findIndex((l) => l === imgTok) + 1;
-  d.editText((s) => s, { range: lineRange(d.md, n) });
-  d.replace([{ s: d.md.indexOf(imgTok), e: d.md.indexOf(imgTok) + imgTok.length, text: '' }]);
+  d.mapPlain((s) => s, { range: lineRange(d.md, n) });
+  d.splice([{ s: d.md.indexOf(imgTok), e: d.md.indexOf(imgTok) + imgTok.length, text: '' }]);
   ({ data } = await d.save({ type: 'uint8array' }));
   assert.doesNotMatch((await DocxProjection.load(data)).md, /image1\.png/);
+});
+
+// ---------- 统一写回路径（splice / diffMd / mapPlain） ----------
+const docXml = async (data) => (await (await JSZip.loadAsync(data)).file('word/document.xml').async('string'));
+const bodyRuns = async (data) => [...(await docXml(data)).matchAll(/<w:r>(<w:rPr>.*?<\/w:rPr>)?<w:(t|br)\b[^>]*?(?:\/>|>([^<]*)<\/w:t>)/g)]
+  .map((m) => (m[2] === 'br' ? '⏎' : (m[1]?.includes('<w:b/>') ? 'B:' : '') + m[3]));
+
+test('软换行后插入：字落在换行之后（diffMd / mapPlain 一样）', async () => {
+  const { BR } = await import('../src/plain.js');
+  const buf = await sample(p(t('甲') + '<w:r><w:br/></w:r>' + t('乙')));
+  const a = await DocxProjection.load(buf), b = await DocxProjection.load(buf);
+  a.mapPlain((s) => s.replace(BR + '乙', BR + 'X乙'));
+  b.diffMd(b.md.replace('<br>乙', '<br>X乙'));
+  for (const d of [a, b]) {
+    const runs = await bodyRuns((await d.save({ type: 'uint8array' })).data);
+    const i = runs.indexOf('甲');
+    assert.deepEqual(runs.slice(i, i + 4), ['甲', '⏎', 'X', '乙']);
+  }
+});
+
+test('替换挂在第一个被删的字、用它的格式：diffMd 与 mapPlain 结果一致', async () => {
+  const buf = await sample(p(t('张') + t('三', true) + t('丰')));
+  const a = await DocxProjection.load(buf), b = await DocxProjection.load(buf);
+  a.mapPlain((s) => s.replace('张三丰', '某丰'));
+  b.diffMd(b.md.replace('张**三**丰', '某丰'));
+  const ra = await bodyRuns((await a.save({ type: 'uint8array' })).data), rb = await bodyRuns((await b.save({ type: 'uint8array' })).data);
+  assert.deepEqual(ra, rb);
+  const i = ra.indexOf('某');
+  assert.deepEqual(ra.slice(i, i + 2), ['某', '丰'], '「某」不加粗（沿用「张」）');
+});
+
+test('diffMd：插入的 Markdown 标记不当文字写进 Word', async () => {
+  const d = await DocxProjection.load(await sample(p(t('尾巴'))));
+  d.diffMd(d.md.replace('尾巴', '尾巴**加粗**\\*'));
+  const runs = await bodyRuns((await d.save({ type: 'uint8array' })).data);
+  assert.ok(runs.includes('加粗*'), runs.join('|'));
+  assert.ok(!runs.some((r) => r.includes('**') || r.includes('\\')));
+});
+
+test('diffMd from 另一投影：移动的图片是图片，不会把说明文字当正文插入', async () => {
+  const buf = await tabSample();
+  const b = await DocxProjection.load(buf);
+  b.diffMd(b.md.replace(imgTok, '').replace('末尾', '末尾' + imgTok));
+  const bp = await DocxProjection.load((await b.save({ type: 'uint8array' })).data);
+  const a = await DocxProjection.load(buf);
+  a.diffMd(bp.md, { from: bp });
+  const { data, warnings } = await a.save({ type: 'uint8array', revisions: true });
+  assert.deepEqual(warnings, []);
+  const xml = await docXml(data);
+  assert.match(xml, /<w:del [^>]*><w:r><w:drawing>/);
+  assert.match(xml, /<w:ins [^>]*><w:r><w:drawing>/);
+  assert.doesNotMatch(xml, /<w:t[^>]*>[^<]*张三身份证/);
+});
+
+test('save 的 report 按实际写入修正：插进别人的修订里算 skipped', async () => {
+  const d = await DocxProjection.load(await sample(p(t('前') + `<w:ins w:id="1" w:author="Bob">${t('他人')}</w:ins>` + t('后'))));
+  const st = d.diffMd(d.md.replace('他人后', '他X人后'));
+  assert.equal(st.ins, 1);
+  const { report } = await d.save({ type: 'uint8array', revisions: true });
+  assert.equal(report.ins, 0);
+  assert.equal(report.skipped, 1);
+});
+
+test('diffSpans：应用后得到新文本；超长行也能算', async () => {
+  const { diffSpans } = await import('../src/plain.js');
+  const apply = (a, spans) => { let out = '', p = 0; for (const x of spans) { out += a.slice(p, x.s) + x.text; p = x.e; } return out + a.slice(p); };
+  const long = (n, seed) => Array.from({ length: n }, (_, i) => '甲乙丙丁'[(i * seed) % 4]).join('');
+  for (const [a, b] of [['联系人张三，电话 139', '联系人某，电话 139****'], ['a\nb\nc', 'a\nB\nc\nd'], [long(3000, 7) + '尾', long(3000, 5) + '尾']]) {
+    const spans = diffSpans(a, b);
+    assert.equal(apply(a, spans), b);
+    for (const x of spans) assert.equal(b.slice(x.at, x.at + x.text.length), x.text);
+  }
+});
+
+test('diffMd：同一张图片只改说明 = 改 alt；换成别的图片不会逐字错配', async () => {
+  const d = await DocxProjection.load(await tabSample());
+  assert.deepEqual(d.diffMd(d.md.replace(imgTok, imgTok.replace('张三', '某'))), { del: 1, ins: 1, skipped: 0 });
+  const xml = await docXml((await d.save({ type: 'uint8array' })).data);
+  assert.match(xml, /descr="某身份证"/);
+  assert.equal((xml.match(/<w:drawing>/g) || []).length, 3, '图片本身没动');
 });

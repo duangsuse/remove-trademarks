@@ -16,7 +16,7 @@ npm test           # round-trip 测试
 ```
  .docx  ──DocxProjection.load──▶  md（Markdown 投影）  ──plainView──▶  txt（纯文本）
    ▲                                │  ▲                                  │
-   └──────────── save() ◀── replace / applyText ◀── plainEdits ◀── fn(txt) => txt'
+   └── save() ◀── splice ◀── diffMd(新 md)       └── mapPlain(fn) ◀── fn(txt) => txt'
 ```
 
 | 层 | 文件 | 内容 |
@@ -26,7 +26,7 @@ npm test           # round-trip 测试
 | 结构约定 | `src/markup.js` | 所有结构标记 / 魔法字符串都只在这里定义 |
 | 识别 | `src/detect.js` + `src/rules.js` | 在 txt 上匹配，命中区间换回 md 坐标 |
 
-改动只落在**可编辑字符**上：Markdown 标记、表格竖线、编号前缀这些结构字符删不掉，也插不进正文；碰到它们的改动记进 `stats.skipped`。
+改动只落在**可编辑字符**上：Markdown 标记、表格竖线、编号前缀这些结构字符删不掉，也插不进正文；碰到它们的改动记进 `skipped`。
 
 ## 投影 API
 
@@ -40,24 +40,29 @@ d.text        // 纯文本投影
 d.warnings    // 没处理的内容（多行文字）
 d.unhandled   // 投影不了的元素 [{ tag: 'm:oMath', count: 2 }, …]
 
-d.editText(fn, { range })   // 用函数改纯文本；range = [s, e]（md 坐标），只把这一段交给 fn
-d.applyText(newMd)          // 拿改过的整份 md 做 diff 写回
-d.replace([{ s, e, text }]) // 按 md 区间替换；s === e 表示纯插入
-d.dropImages(paths)         // 换成 1×1 占位图
-d.wipe()                    // 抹掉作者、批注、修订记录、rsid 等不可见指纹
+d.locate(i)   // md 第 i 个字属于哪个段落 / 文本单元，可不可编辑
+await d.media() // word/media/* 的图片 [{ path, bytes, mime, replaceable, uses: [{ s, e }] }]
 
-const { blob, stats, warnings } = await d.save();                         // 浏览器
-const { data } = await d.save({ type: 'uint8array', track: true });       // Node；track 表示写成审阅修订
+// 三种改法，按输入的层次分；最后都归到 splice，返回本次的 { del, ins, skipped }
+d.splice([{ s, e, text }])  // md 区间：区间里的可编辑字全删，text 插在第一个被删的字处、用它的格式；s === e 表示纯插入
+d.diffMd(newMd, { from })   // 整份 md：和原投影做 diff，转成 splice；from 是另一个 DocxProjection 时只取它的可编辑字
+d.mapPlain(fn, { range })   // 纯文本：fn(txt) => txt'，diff 转成 splice；range = [s, e]（md 坐标）时只把这一段交给 fn
+
+d.blankImages(paths)        // 换成 1×1 占位图
+d.wipeMetadata()            // 抹掉作者、批注、修订记录、rsid 等不可见指纹
+
+const { blob, report, warnings } = await d.save();                         // 浏览器
+const { data } = await d.save({ type: 'uint8array', revisions: true });    // Node；revisions 表示写成审阅修订
 ```
 
-- `save()` 只能调用一次（会改写 DOM）。
-- 坐标都按**载入时**的投影算。多次调用 `editText` / `replace` 的改动会叠加，但后一次看不到前一次的结果。
+- `save()` 只能调用一次（会改写 DOM）。`report` 是按实际写入修正过的累计 `{ del, ins, skipped }`。
+- 坐标都按**载入时**的投影算。多次调用 `splice` / `diffMd` / `mapPlain` 的改动会叠加，但后一次看不到前一次的结果。
 - 载入时会先「拒绝」掉本工具以前写进去的审阅修订，所以反复写修订不会越叠越多。
 
 ### 例 1：把全文的「张三」换成「某先生」
 
 ```js
-d.editText((s) => s.replaceAll('张三', '某先生'));
+d.mapPlain((s) => s.replaceAll('张三', '某先生'));
 ```
 
 `张**三**` 这种半个字加粗的情况也能换掉；替换后的字沿用原来那个字的格式。链接文字、图片说明、文本框、页眉、图表标题会一起换。
@@ -65,7 +70,7 @@ d.editText((s) => s.replaceAll('张三', '某先生'));
 ### 例 2：只隐去第 11~22 行的手机号（选区）
 
 ```js
-d.editText((s) => s.replace(/1[3-9]\d{9}/g, (m) => m.slice(0, 3) + '****' + m.slice(7)),
+d.mapPlain((s) => s.replace(/1[3-9]\d{9}/g, (m) => m.slice(0, 3) + '****' + m.slice(7)),
            { range: lineRange(d.md, 11, 22) });
 ```
 
@@ -74,8 +79,8 @@ d.editText((s) => s.replace(/1[3-9]\d{9}/g, (m) => m.slice(0, 3) + '****' + m.sl
 ### 例 3：插入、删除
 
 ```js
-d.editText((s) => s.replace('联系人：', '联系人（已核实）：'));   // 纯插入
-d.editText((s) => s.replace('，电话 13912345678', ''));             // 纯删除
+d.mapPlain((s) => s.replace('联系人：', '联系人（已核实）：'));   // 纯插入
+d.mapPlain((s) => s.replace('，电话 13912345678', ''));             // 纯删除
 ```
 
 ### 例 4：识别时注入 NER 函数
@@ -130,7 +135,7 @@ const { fs, doc, DocxProjection } = __di;
 for (const { name, h } of await fs.list(doc.dir)) {
   if (!/\.docx$/.test(name) || /_隐号/.test(name)) continue;
   const d = await DocxProjection.load(await fs.read(h));
-  d.editText((s) => s.replace(/(1[3-9]\d)\d{8}/g, '$1********'));
+  d.mapPlain((s) => s.replace(/(1[3-9]\d)\d{8}/g, '$1********'));
   const { blob } = await d.save();
   await fs.write(await fs.child(doc.dir, name.replace(/\.docx$/, '_隐号.docx'), true), blob);
 }
@@ -148,7 +153,7 @@ await fs.recall('上次的规则');
 
 每种文本格式由一个模块负责读和写，调用方不自己拼分隔符或标记。
 
-**投影的结构（`src/markup.js`）**：`docx.js` 用 `makeMarks()` 写结构，其他代码用 `readLines(md)` 读。`readLines` 逐行标出 `kind`（`open` / `close` / `cell` / `table` / `tableSep` / `rule` / `text`），并标出这一行是否属于结构（`structural`）、是否已进入「其他文本」区（`others`）。识别表格里的姓名、整理章节、准备 NER 输入都通过它来读结构。
+**投影的结构（`src/markup.js`）**：`docx.js` 用 `makeMarks()` 写结构，其他代码用 `mdLines(md)` 读。`mdLines` 逐行标出 `kind`（`open` / `close` / `cell` / `table` / `tableSep` / `rule` / `text`），并标出这一行是否属于结构（`structural`）、是否已进入「其他文本」区（`others`）。识别表格里的姓名、整理章节、准备 NER 输入都通过它来读结构。
 
 | 结构 | 写法 |
 |---|---|
@@ -172,7 +177,7 @@ await fs.recall('上次的规则');
 import { makeMarks } from './src/markup.js';
 await DocxProjection.load(buf, {
   marks: makeMarks({ open: '[[表', openNote: '', close: '表]]' }),
-  author: '我的工具',  // save({ track: true }) 写入的修订作者；载入时先拒绝掉这个作者以前写的修订
+  author: '我的工具',  // save({ revisions: true }) 写入的修订作者；载入时先拒绝掉这个作者以前写的修订
   i18n: {              // 界面文字，按组覆盖，默认值见 docx.js 的 I18N
     parts: { header: 'Header', footer: 'Footer', textbox: 'Text box' },
     warn: { noMain: (path) => `main part not found: ${path}` },

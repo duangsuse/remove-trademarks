@@ -1,6 +1,6 @@
 // 规则执行：扫描 Markdown → 候选项；选区；替换；章节。规则本身见 rules.js，投影结构见 markup.js，输入框格式见 boxes.js
 import { RULES, ABBR_MAX, ABBR_RE, NAME_LABELS, NAME_VALUE, NAME_STOP, NER_GROUPS, CHAPTER_FALLBACK } from './rules.js';
-import { readLines } from './markup.js';
+import { mdLines } from './markup.js';
 import { lineRule } from './boxes.js';
 import { plainView, unmark } from './plain.js';
 
@@ -204,7 +204,7 @@ export function selection(items, isOn) {
 
 // 章节：优先 # 标题，没有则按编号回退；范围到下一个同级或更高级标题（或"其他文本"区）之前
 export function chapters(md) {
-  const all = readLines(md), lines = all.filter((l) => !l.others);
+  const all = mdLines(md), lines = all.filter((l) => !l.others);
   let heads = [];
   for (const { text, s } of lines) { const m = /^(#{1,6}) (.+)$/.exec(text); if (m) heads.push({ level: m[1].length, title: unmark(m[2]), s }); }
   if (heads.length < 3) { // 样式标题太少（常见于手工排版的申报书）：叠加按编号识别

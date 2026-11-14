@@ -1,8 +1,8 @@
 import './style.css';
-import { DocxProjection, listImages } from './docx.js';
+import { DocxProjection } from './docx.js';
 import { scan, replacement, selection, chapters, nerLines } from './detect.js';
 import { plainOf, unmark, spliceMd, lineRange } from './plain.js';
-import { partnerOf, readLines } from './markup.js';
+import { partnerOf, mdLines } from './markup.js';
 import { BlackBox, lineRule, parseRules, parseCustom } from './boxes.js';
 import { MAIN, EXTRA, TOOLS, TYPE_NAME, DEFAULT_REPLACE_RULES, HIDE_WHEN_OFF, TAG_CATS, ENT_CATS, TITLE_RE, ABBR_MAX, RULES, FINGERPRINT_URL, ABBR_RE, NAME_LABELS, NAME_VALUE } from './rules.js';
 import * as ner from './ner.js';
@@ -215,7 +215,7 @@ Object.defineProperties(ta, {
 ta.setSelectionRange = (s, e) => { const g = getSelection(); g.removeAllRanges(); g.addRange(rangeOf(s, e)); lastSel = [s, e]; };
 // 特殊表格的边界行（点一下会跳到另一头）；#editor 模式也要画
 function frameLines(by) {
-  for (const l of readLines(ta.value)) if (l.kind === 'open' || l.kind === 'close') (by.frame ||= new Highlight()).add(rangeOf(l.s, l.s + l.text.length));
+  for (const l of mdLines(ta.value)) if (l.kind === 'open' || l.kind === 'close') (by.frame ||= new Highlight()).add(rangeOf(l.s, l.s + l.text.length));
 }
 // 高亮：每个类别一个 Highlight（样式见 ::highlight(...)）；未选中（不会被打码）的统一用 off（下划线）
 function paintHighlights(occ) {
@@ -527,8 +527,7 @@ $('gallery').addEventListener('mouseout', (e) => { if (e.target.closest('.thumb'
 $('gallery').addEventListener('contextmenu', (e) => { // 右键：在正文里定位该图片（到头后回第一处）
   const b = e.target.closest('.thumb[data-p]'); if (!b) return;
   e.preventDefault();
-  const rel = b.dataset.p.replace(/^word\//, '');
-  const occ = (doc.parsed?.images || []).filter((x) => x.path === rel).map((x) => [x.s, x.e]);
+  const occ = (doc.images.find((i) => i.path === b.dataset.p)?.uses || []).map((x) => [x.s, x.e]);
   if (!occ.length) return status('这张图片在正文里没有出现位置（可能在页眉页脚 / 母版里）');
   locT.kind = 'img'; locT.id = b.dataset.p;
   locate(occ);
@@ -570,10 +569,10 @@ const applyAll = () => guarded(async () => {
   const granted = !!doc.dir && (await fs.allowed(doc.dir, true, true)); // 需在用户手势内先拿权限
   const dropImages = EDITOR ? [] : doc.images.filter((i) => i.replaceable && !doc.keep.has(i.path)).map((i) => i.path);
   const d = await DocxProjection.load(doc.buffer);
-  const stats = EDITOR ? d.applyText(ta.value) : d.replace(redactions());
-  d.dropImages(dropImages);
-  if (!EDITOR && state.cats.meta) d.wipe();
-  const { blob, warnings } = await d.save();
+  if (EDITOR) d.diffMd(ta.value); else d.splice(redactions());
+  d.blankImages(dropImages);
+  if (!EDITOR && state.cats.meta) d.wipeMetadata();
+  const { blob, report: stats, warnings } = await d.save();
   const fh = granted ? await fs.child(await outDir(true), outName(), true) : await fs.pickSave(outName(), DOCX_TYPE);
   await fs.write(fh, blob);
   doc.outHandle = fh;
@@ -623,9 +622,9 @@ const reviewToA = () => guarded(async () => {
   if (!hB) { status(`未找到 ${OUT_DIR}/${outName()}：请先 Ctrl+S 生成，或在弹出的窗口里选择要对比的文件`); hB = await fs.pickFile(DOCX_TYPE); }
   const b = await DocxProjection.load(await fs.read(hB));
   const a = await DocxProjection.load(await fs.read(doc.cur.h)); // 现读 A：保留打开后在 Word 里做的修改，上次写入的修订载入时已撤掉
-  const stats = a.applyText(b.md, { from: b });
-  if (!stats.del && !stats.ins) return status(`${doc.cur.name} 与 ${hB.name} 的文字没有差异，未写入`);
-  const { blob, warnings } = await a.save({ track: true });
+  const diff = a.diffMd(b.md, { from: b });
+  if (!diff.del && !diff.ins) return status(diff.skipped ? `${doc.cur.name} 与 ${hB.name} 有 ${diff.skipped} 处差异无法写成修订，未写入` : `${doc.cur.name} 与 ${hB.name} 的文字没有差异，未写入`);
+  const { blob, report: stats, warnings } = await a.save({ revisions: true });
   await fs.write(doc.cur.h, blob);
   alertList(`已写入 ${doc.cur.name}，但有以下问题：`, warnings);
   status(`已把 ${hB.name} 的差异写入 ${doc.cur.name}：${stats.del} 处删除 / ${stats.ins} 处插入` + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · 请在 Word 审阅面板检查后保存');
@@ -710,7 +709,7 @@ async function openDoc(i, auto = false, noNer = false) {
   const p = await DocxProjection.load(doc.buffer);
   doc.parsed = p; doc.orig = p.md;
   doc.images.forEach((x) => x.url && URL.revokeObjectURL(x.url));
-  doc.images = await listImages(p.zip);
+  doc.images = (await p.media()).map((i) => ({ ...i, bytes: null, url: i.mime ? URL.createObjectURL(new Blob([i.bytes], { type: i.mime })) : '' }));
   resetKeep();
   ta.value = p.md; ta.setSelectionRange(0, 0); ta.scrollTop = 0; state.ner = []; state.on = {}; memo.clear(); 
   doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0;

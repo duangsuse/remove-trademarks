@@ -35,14 +35,13 @@ const d = await DocxProjection.load(readFileSync(src));
 for (const w of d.warnings) console.error('⚠ ' + w);
 const ranges = o.L.map((l) => lineRule.parse('#L' + l.replace(/^#?L?/i, ''))).filter(Boolean);
 
-let stats;
 switch (cmd) {
   case 'md': process.stdout.write(d.md); process.exit(0);
   case 'txt': process.stdout.write(d.text); process.exit(0);
-  case 'apply': stats = d.applyText(readFileSync(mdFile, 'utf8')); break;
+  case 'apply': d.diffMd(readFileSync(mdFile, 'utf8')); break;
   case 'edit': {
     const fn = (0, eval)(o.e); // 自己机器上跑自己写的函数
-    stats = d.editText(fn, { range: ranges[0] && lineRange(d.md, ...ranges[0]) });
+    d.mapPlain(fn, { range: ranges[0] && lineRange(d.md, ...ranges[0]) });
     break;
   }
   case 'redact': {
@@ -51,7 +50,7 @@ switch (cmd) {
     const rules = parseRules(o.r.length ? o.r.join('\n') : DEFAULT_REPLACE_RULES);
     const sel = selection([...items.values()], (it) => cats.has(it.en));
     const nums = new Map(), nth = (kind, s) => { const m = nums.get(kind) ?? nums.set(kind, new Map()).get(kind); if (!m.has(s)) m.set(s, m.size + 1); return m.get(s); }; // 同类按首次出现编号
-    stats = d.replace(sel.map((x) => {
+    d.splice(sel.map((x) => {
       const s = plainOf(d.md, x.s, x.e);
       return { s: x.s, e: x.e, text: x.it.del ? '' : replacement(s, rules, { names: [x.it.cat, x.it.en, x.it.text], kind: x.it.cat, nth }) };
     }));
@@ -60,7 +59,7 @@ switch (cmd) {
   default: console.log(HELP); process.exit(1);
 }
 const out = o.o || src.replace(/\.docx$/i, '') + (cmd === 'redact' ? '_脱敏.docx' : '_新版.docx');
-const { data, warnings } = await d.save({ type: 'uint8array', track: o.track });
+const { data, report: stats, warnings } = await d.save({ type: 'uint8array', revisions: o.track });
 writeFileSync(out, data);
 for (const w of warnings.filter((w) => !d.warnings.includes(w))) console.error('⚠ ' + w);
 console.error(`→ ${out}：${stats.del} 删 / ${stats.ins} 插` + (stats.skipped ? `，${stats.skipped} 处无法映射（结构字符）` : ''));
