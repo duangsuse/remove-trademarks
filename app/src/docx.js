@@ -22,10 +22,12 @@ const NS = {
 };
 // 正文以外要投影的部件（主文档关系的类型），标题见 I18N.parts
 const TEXT_PARTS = ['header', 'footer', 'footnotes', 'endnotes'];
+const REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/';
 
 // 界面文字，opts.i18n 按组覆盖：{ parts: { header: 'Header' }, warn: { noMain: (p) => … } }
 export const I18N = {
-  parts: { header: '页眉', footer: '页脚', footnotes: '脚注', endnotes: '尾注', textbox: '文本框', chart: '图表', smartart: 'SmartArt' },
+  parts: { header: '页眉', footer: '页脚', footnotes: '脚注', endnotes: '尾注', textbox: '文本框', chart: '图表', smartart: 'SmartArt', link: '链接地址' },
+  comment: (what, from, to) => `${what}：「${from}」→「${to}」`, // 审阅模式下没有修订语法的改动（图表 / SmartArt 文字等）写成批注
   notes: { oMath: '公式', oMathPara: '公式', ruby: '注音', altChunk: '嵌入的外部文档', object: 'OLE 对象', t: '没投影到的文字', comment: '批注' }, // unhandled 里各标签的说明
   warn: {
     parseFailed: (path) => `${path} 解析失败，其中的文字没有处理`,
@@ -34,7 +36,7 @@ export const I18N = {
     embeddings: (n) => `有 ${n} 个内嵌对象（Excel / Visio / 图表数据等，word/embeddings/），里面的内容原样保留`,
     vectors: (n) => `有 ${n} 张 svg / emf 等格式的图片不能替换成占位图（svg 常与同名 png 成对，只换 png 时 Word 仍显示 svg）`,
     newImages: (n) => `${n} 处新增图片被忽略（图片只能删除、移动或复制文档里已有的：路径须与原图相同，且在同一部分——正文 / 页眉等不能互相搬）`,
-    untracked: (n) => `${n} 处链接地址 / 图片说明 / 图表文字无法写成修订，未改动`,
+    untracked: (n) => `${n} 处页眉页脚里的图表 / SmartArt / 链接文字已直接改动（那里加不了批注）`,
     failed: (n) => `${n} 段写入失败（详见控制台），这些段落保持原样`,
     unmerged: (n) => `${n} 处段落合并没写入（后面不是段落，或会删掉分节符）`,
     foreign: (n) => `${n} 处插入落在别人的修订里，没写入`,
@@ -42,7 +44,7 @@ export const I18N = {
     savedTwice: 'DocxProjection.save() 只能调用一次',
   },
 };
-const mergeI18n = (o = {}) => Object.fromEntries(Object.entries(I18N).map(([k, v]) => [k, { ...v, ...o[k] }]));
+const mergeI18n = (o = {}) => Object.fromEntries(Object.entries(I18N).map(([k, v]) => [k, typeof v === 'function' ? o[k] ?? v : { ...v, ...o[k] }]));
 
 // 1×1 占位图（dropImages），按扩展名
 const PLACEHOLDER = {
@@ -279,6 +281,8 @@ function rejectOurs(doc, author) {
     while (x.firstChild) x.parentNode.insertBefore(x.firstChild, x);
     x.remove(); n++;
   }
+  // 改链接地址时插入的新链接：里面的插入撤掉后只剩空壳
+  for (const t of ['hyperlink', 'fldSimple']) for (const x of [...doc.getElementsByTagNameNS(NS.WORD, t)]) if (![...x.childNodes].some((c) => c.nodeType === 1)) { x.remove(); n++; }
   // 格式修订：换回 rPrChange 里记的原格式
   for (const x of byTag('rPrChange')) {
     const rPr = x.parentNode, old = kid(x, 'rPr');
@@ -454,6 +458,34 @@ function splitPara(p, marker, ctx) {
   return np;
 }
 
+// root 里还没进修订的 run 各自包进 w:ins / w:del（删除时 w:t / w:instrText 换成 w:delText / w:delInstrText）
+function trackRuns(root, kind, ctx) {
+  const doc = root.ownerDocument;
+  for (const r of [...root.getElementsByTagNameNS(NS.WORD, 'r')]) {
+    let inside = false;
+    for (let n = r.parentNode; n && n !== root.parentNode; n = n.parentNode) if (isW(n, 'ins') || isW(n, 'del')) inside = true;
+    if (inside) continue;
+    if (kind === 'del') for (const x of [...r.childNodes]) if (isW(x, 't') || isW(x, 'instrText')) x.replaceWith(mkText(doc, x.localName === 't' ? 'delText' : 'delInstrText', x.textContent));
+    const w = mkEl(doc, kind, ctx.meta());
+    r.parentNode.insertBefore(w, r);
+    w.appendChild(r);
+  }
+}
+
+// 改链接地址（审阅模式）：原链接整个标成删除，后面跟一份用 setNew 改了地址、整个标成插入的副本
+function reviseLink(h, setNew, ctx) {
+  const neu = h.cloneNode(true);
+  setNew(neu);
+  for (const x of [...h.getElementsByTagNameNS(NS.WORD, 'ins')]) if (x.getAttributeNS(NS.WORD, 'author') === ctx.author) x.remove();
+  trackRuns(h, 'del', ctx);
+  for (const x of [...neu.getElementsByTagNameNS(NS.WORD, 'del')]) x.remove();
+  for (const x of [...neu.getElementsByTagNameNS(NS.WORD, 'ins')]) { while (x.firstChild) x.parentNode.insertBefore(x.firstChild, x); x.remove(); }
+  trackRuns(neu, 'ins', ctx);
+  h.parentNode.insertBefore(neu, h.nextSibling);
+}
+
+const closestP = (n) => { for (; n && n.nodeType === 1; n = n.parentNode) if (isW(n, 'p')) return n; return null; };
+
 // 段落之间可以跳过的范围标记（书签、批注范围等）
 const RANGE_MARKS = new Set(['bookmarkStart', 'bookmarkEnd', 'commentRangeStart', 'commentRangeEnd', 'permStart', 'permEnd', 'proofErr', 'moveFromRangeStart', 'moveFromRangeEnd', 'moveToRangeStart', 'moveToRangeEnd']);
 const nextBlock = (n) => { for (n = n.nextSibling; n; n = n.nextSibling) if (n.nodeType === 1 && !(n.namespaceURI === NS.WORD && RANGE_MARKS.has(n.localName))) return n; return null; };
@@ -564,12 +596,11 @@ function applyParaEdits(para, ed, ctx) {
   return { dropped, frags };
 }
 
-function applyTextEdits(u, ed) {
+// 文本单元改完后的文字
+function textAfter(u, ed) {
   let s = '';
   u.atoms.forEach((a, i) => { s += ed.ins.get(i) ?? ''; if (!ed.del.has(i)) s += a.ch; });
-  s = (s + (ed.ins.get(u.atoms.length) ?? '')).replace(/[\n\u2029]/g, ' ').replace(/\uFFFC/g, ''); // 属性文字里放不了图片、不能分段
-  u.set(s);
-  return s;
+  return (s + (ed.ins.get(u.atoms.length) ?? '')).replace(/[\n\u2029]/g, ' ').replace(/\uFFFC/g, ''); // 属性文字里放不了图片、不能分段
 }
 
 // 文本框 mc:AlternateContent：投影 / 编辑的是 Choice（wps），Fallback（VML）里还有一份原文——改过的照 Choice 同步过去
@@ -624,6 +655,8 @@ export class DocxProjection {
   #edits = new Edits();
   #mirrors = [];
   #blank = [];
+  #mainPath = '';
+  #types = []; // 新加的部件要登记进 [Content_Types].xml 的 <Override>
   #wipe = false;
   #saved = false;
 
@@ -749,19 +782,38 @@ export class DocxProjection {
     this.#saved = true;
     const warnings = [...this.warnings], stats = { ...this.#stats }, t = this.#opts.i18n, track = revisions;
     const ctx = { author, date: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), nextId: maxId(this.#textParts) + 1, track };
-    const edited = [], mirror = new Map();
+    ctx.meta = () => ({ id: String(ctx.nextId++), author: ctx.author, date: ctx.date });
+    let docPr = 0; // wp:docPr 的 id（与 w:id 是两套编号）；复制出来的图片要换新 id
+    for (const part of this.#textParts) for (const el of part.doc.getElementsByTagNameNS(NS.WP, 'docPr')) docPr = Math.max(docPr, +el.getAttribute('id') || 0);
+    ctx.renew = (r) => { for (const el of r.getElementsByTagNameNS(NS.WP, 'docPr')) el.setAttribute('id', String(++docPr)); };
+    const edited = [], mirror = new Map(), later = [];
     let untracked = 0, failed = 0, foreign = 0;
     const merges = [];
     const added = this.#pairImages(ctx);
+    // 文本单元（链接地址、图片说明、图表文字…）：非审阅模式直接改；审阅模式下图片说明改成「删原图 + 插改了说明的副本」，其余等段落改完再处理
+    const reimg = new Map(); // 图片原子 -> [[单元, 新值]]
     for (const [pid, ed] of this.#edits) {
       const u = this.#units[pid];
-      if (u.kind === 'text') {
-        if (track) { untracked++; continue; } // 属性 / 关系里的文字没有修订语法，写了就清不掉
-        const v = applyTextEdits(u, ed);
-        if (u.mirror) mirror.set(u.orig, v);
-        u.part.dirty = true;
-        continue;
-      }
+      if (u.kind !== 'text') continue;
+      const v = textAfter(u, ed);
+      if (!track) { u.set(v); if (u.mirror) mirror.set(u.orig, v); u.part.dirty = true; continue; }
+      const a = u.attr && u.obj.atom;
+      if (a && !a.locked && !this.#edits.get(a.pid)?.drop.has(a.off)) { if (!reimg.has(a)) reimg.set(a, []); reimg.get(a).push([u, v]); }
+      else later.push([u, v]);
+    }
+    for (const [a, list] of reimg) {
+      const ped = this.#edits.of(a.pid), r = a.r.cloneNode(false), rpr = kid(a.r, 'rPr');
+      if (rpr) r.appendChild(rpr.cloneNode(true));
+      r.appendChild(a.item.cloneNode(true));
+      for (const [u, v] of list) u.setOn(r, v);
+      ctx.renew(r);
+      ped.drop.add(a.off);
+      ped.ins.set(a.off, OBJ + (ped.ins.get(a.off) || ''));
+      ped.nodes.set(a.off, [r, ...(ped.nodes.get(a.off) || [])]);
+    }
+    for (const [pid, ed] of this.#edits) {
+      const u = this.#units[pid];
+      if (u.kind === 'text') continue;
       const backup = u.el.cloneNode(true);
       ctx.created = [];
       try {
@@ -777,6 +829,30 @@ export class DocxProjection {
     }
     let unmerged = 0;
     for (const [, el] of merges.sort((a, b) => a[0] - b[0])) if (!mergeMark(el, ctx)) unmerged++; // 按文档顺序合并
+    // 审阅模式下的链接地址：整个链接删 + 插；图表 / SmartArt / 复杂域链接没有修订语法：直接改，在所在段落加批注写明原文
+    const notes = new Map(), mainDoc = this.#parts.get(this.#mainPath)?.doc;
+    for (const [u, v] of later) {
+      if (u.link) {
+        const id = this.#addRel(u.link.rels, u.link.type, v, true);
+        for (const h of [...u.link.part.doc.getElementsByTagNameNS(NS.WORD, 'hyperlink')]) if (h.getAttributeNS(NS.R, 'id') === u.link.id) reviseLink(h, (el) => el.setAttributeNS(NS.R, 'r:id', id), ctx);
+        u.link.part.dirty = true;
+        continue;
+      }
+      if (u.field) {
+        reviseLink(u.field, (el) => el.setAttributeNS(NS.WORD, 'w:instr', (el.getAttributeNS(NS.WORD, 'instr') || '').replace(HYPER, (_, a, _u, c) => a + v + c)), ctx);
+        u.part.dirty = true;
+        continue;
+      }
+      const from = u.atoms.map((a) => a.ch).join('');
+      u.set(v); u.part.dirty = true;
+      if (u.mirror) mirror.set(u.orig, v);
+      if (u.attr) continue; // 图片已删掉 / 在别人的修订里：直接改说明
+      const p = closestP(u.anchor || u.obj?.atom?.item);
+      if (!p || p.ownerDocument !== mainDoc) { untracked++; continue; }
+      if (!notes.has(p)) notes.set(p, []);
+      notes.get(p).push(t.comment(u.anchor ? t.parts.link : u.label, from, v));
+    }
+    for (const [p, lines] of notes) await this.#addComment(p, lines, ctx);
     if (unmerged) { warnings.push(t.warn.unmerged(unmerged)); stats.skipped += unmerged; }
     if (foreign) warnings.push(t.warn.foreign(foreign));
     if (added) { warnings.push(t.warn.newImages(added)); stats.ins = Math.max(0, stats.ins - added); stats.skipped += added; }
@@ -798,6 +874,12 @@ export class DocxProjection {
       const key = ext === 'jpeg' ? 'jpg' : ext;
       if (PLACEHOLDER[key] && this.#zip.file(path)) this.#zip.file(path, b64(PLACEHOLDER[key]));
     }
+    if (this.#types.length) {
+      const f = this.#zip.file('[Content_Types].xml');
+      let x = (await f.async('string')).replace(/<Types([^>]*)\/>/, '<Types$1></Types>');
+      for (const [part, type] of this.#types) if (!x.includes(`PartName="/${part}"`)) x = x.replace('</Types>', `<Override PartName="/${part}" ContentType="${type}"/></Types>`);
+      this.#zip.file('[Content_Types].xml', x);
+    }
     if (this.#wipe) await wipeParts(this.#zip);
     const out = await this.#zip.generateAsync({ type, compression: 'DEFLATE', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
     return { [type === 'blob' ? 'blob' : 'data']: out, report: stats, warnings };
@@ -813,9 +895,8 @@ export class DocxProjection {
       return r;
     };
     const gone = this.#edits.dropped.map((img) => ({ img, r: objRun(img), used: false }));
-    let ignored = 0, docPr = 0; // wp:docPr 的 id（与 w:id 是两套编号）
-    for (const part of this.#textParts) for (const el of part.doc.getElementsByTagNameNS(NS.WP, 'docPr')) docPr = Math.max(docPr, +el.getAttribute('id') || 0);
-    const renew = (r) => { for (const el of r.getElementsByTagNameNS(NS.WP, 'docPr')) el.setAttribute('id', String(++docPr)); };
+    let ignored = 0;
+    const { renew } = ctx;
     for (const [pid, ed] of this.#edits) {
       for (const [at, paths] of ed.refs) {
         const u = this.#units[pid], nodes = [];
@@ -834,6 +915,53 @@ export class DocxProjection {
   }
 
   #count(st) { for (const k in st) this.#stats[k] += st[k]; return st; }
+
+  // 在关系部件 rels（{path, doc}，没有则按 owner 部件新建）里加一条关系，返回新 Id
+  #addRel(rels, type, target, external = false, owner = this.#mainPath) {
+    if (!rels) {
+      const path = relsPathOf(owner);
+      rels = this.#parts.get(path);
+      if (!rels) { rels = { path, doc: new DOMParser().parseFromString(`<Relationships xmlns="${NS.PKG}"/>`, 'application/xml'), dirty: true }; this.#parts.set(path, rels); }
+    }
+    const ids = new Set([...rels.doc.getElementsByTagNameNS(NS.PKG, 'Relationship')].map((r) => r.getAttribute('Id')));
+    let n = 1;
+    while (ids.has('rIdDi' + n)) n++;
+    const el = rels.doc.createElementNS(NS.PKG, 'Relationship');
+    el.setAttribute('Id', 'rIdDi' + n);
+    el.setAttribute('Type', type);
+    el.setAttribute('Target', target);
+    if (external) el.setAttribute('TargetMode', 'External');
+    rels.doc.documentElement.appendChild(el);
+    rels.dirty = true;
+    return 'rIdDi' + n;
+  }
+
+  // 给正文段落 p 整段加一条批注（lines 每行一段）；没有批注部件就新建
+  async #addComment(p, lines, ctx) {
+    const relsPath = relsPathOf(this.#mainPath), rels = this.#parts.get(relsPath);
+    let rel = rels && [...rels.doc.getElementsByTagNameNS(NS.PKG, 'Relationship')].find((r) => r.getAttribute('Type') === REL_TYPE + 'comments');
+    let part = rel && this.#parts.get(resolvePath(this.#mainPath, rel.getAttribute('Target')));
+    if (rel && !part) { const path = resolvePath(this.#mainPath, rel.getAttribute('Target')); const doc = await loadXml(this.#zip, path, () => {}); if (doc) this.#parts.set(path, (part = { path, doc, dirty: false })); }
+    if (!part) {
+      const path = this.#mainPath.replace(/[^/]*$/, 'comments.xml');
+      part = { path, doc: new DOMParser().parseFromString(`<w:comments xmlns:w="${NS.WORD}"/>`, 'application/xml'), dirty: true };
+      this.#parts.set(path, part);
+      this.#addRel(rels, REL_TYPE + 'comments', 'comments.xml');
+      this.#types.push([path, 'application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml']);
+    }
+    const doc = p.ownerDocument, cdoc = part.doc, id = String(ctx.nextId++);
+    const c = cdoc.createElementNS(NS.WORD, 'w:comment');
+    for (const [k, v] of [['id', id], ['author', ctx.author], ['date', ctx.date]]) c.setAttributeNS(NS.WORD, 'w:' + k, v);
+    for (const line of lines) { const cp = mkEl(cdoc, 'p'), r = mkEl(cdoc, 'r'); r.appendChild(mkText(cdoc, 't', line)); cp.appendChild(r); c.appendChild(cp); }
+    cdoc.documentElement.appendChild(c);
+    part.dirty = true;
+    const pPr = kid(p, 'pPr');
+    p.insertBefore(mkEl(doc, 'commentRangeStart', { id }), pPr ? pPr.nextSibling : p.firstChild);
+    p.appendChild(mkEl(doc, 'commentRangeEnd', { id }));
+    const ref = mkEl(doc, 'r');
+    ref.appendChild(mkEl(doc, 'commentReference', { id }));
+    p.appendChild(ref);
+  }
 
   async #load(buffer) {
     const zip = (this.#zip = await JSZip.loadAsync(buffer));
@@ -855,7 +983,7 @@ export class DocxProjection {
       }
       return m;
     };
-    const mainPath = [...(await rels('')).values()].find((r) => r.type === 'officeDocument')?.path || 'word/document.xml';
+    const mainPath = (this.#mainPath = [...(await rels('')).values()].find((r) => r.type === 'officeDocument')?.path || 'word/document.xml');
     const main = await load(mainPath);
     const mainRels = await rels(mainPath);
     const ofType = (t) => [...new Set([...mainRels.values()].filter((r) => r.type === t && !r.external).map((r) => r.path))].sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
@@ -876,12 +1004,13 @@ export class DocxProjection {
     const relLink = (h, part) => {
       const r = relsOf.get(part.path)?.get(h.getAttributeNS(NS.R, 'id'));
       if (!r?.external) return null; // 文档内锚点（目录等）不显示成链接
-      if (!linkUnits.has(r.el)) linkUnits.set(r.el, { unit: textUnit(r.part, r.target, (v) => r.el.setAttribute('Target', v)) });
+      if (!linkUnits.has(r.el)) linkUnits.set(r.el, { unit: textUnit(r.part, r.target, (v) => r.el.setAttribute('Target', v), { link: { rels: r.part, id: h.getAttributeNS(NS.R, 'id'), type: r.el.getAttribute('Type'), part } }) });
       return linkUnits.get(r.el);
     };
-    const fieldLink = (get, set, part) => {
+    // field：w:fldSimple（审阅模式下整个换成删 + 插）；anchor：复杂域的 separate（只能直接改 + 批注）
+    const fieldLink = (get, set, part, extra) => {
       const m = HYPER.exec(get());
-      return m ? { unit: textUnit(part, m[2], (v) => set(get().replace(HYPER, (_, a, _u, c) => a + v + c))) } : null;
+      return m ? { unit: textUnit(part, m[2], (v) => set(get().replace(HYPER, (_, a, _u, c) => a + v + c)), extra) } : null;
     };
     const object = (d, part) => {
       const rel = (id) => (id ? relsOf.get(part.path)?.get(id) : null);
@@ -895,13 +1024,17 @@ export class DocxProjection {
         else if (uri.endsWith('/diagram')) { label = t.parts.smartart; embed = 'smartart'; target = rel(own(gd, NS.DGM, 'relIds')?.getAttributeNS(NS.R, 'dm')); }
       }
       if (!target) return null;
-      if (embed && !target.external) found.push({ embed, path: target.path });
-      const docPr = own(d, NS.WP, 'docPr'), cNvPr = own(d, NS.PIC, 'cNvPr');
+      // 图片说明 / 标题：setOn(root, 新值) 改 root 里的 docPr（及同值的 pic:cNvPr），审阅模式下改在图片副本上
       const attr = (name) => {
-        const v = docPr?.getAttribute(name);
-        return v ? textUnit(part, v, (nv) => { docPr.setAttribute(name, nv); if (cNvPr?.getAttribute(name) === v) cNvPr.setAttribute(name, nv); }) : null;
+        const v = own(d, NS.WP, 'docPr')?.getAttribute(name);
+        if (!v) return null;
+        const setOn = (root, nv) => { const dp = own(root, NS.WP, 'docPr'), cn = own(root, NS.PIC, 'cNvPr'); if (cn && cn.getAttribute(name) === dp?.getAttribute(name)) cn.setAttribute(name, nv); dp?.setAttribute(name, nv); };
+        return textUnit(part, v, (nv) => setOn(d, nv), { attr: name, setOn });
       };
-      return { label, path: target.external ? target.target : target.path.replace(/^word\//, ''), alt: attr('descr'), title: attr('title') };
+      const o = { label, path: target.external ? target.target : target.path.replace(/^word\//, ''), alt: attr('descr'), title: attr('title') };
+      for (const u of [o.alt, o.title]) if (u) u.obj = o;
+      if (embed && !target.external) found.push({ embed, path: target.path, obj: o });
+      return o;
     };
 
     // 段落原子：每个字一个；制表 / 换行 / 图片等是不可编辑的原子
@@ -914,7 +1047,7 @@ export class DocxProjection {
         for (const c of r.childNodes) {
           if (c.nodeType !== 1) continue;
           const base = { r, item: c, fmt, locked, link: cur() };
-          const obj = (d) => { const o = d && object(d, part); if (o) atoms.push({ ...base, ch: '\uFFFC', obj: o, edit: false }); };
+          const obj = (d) => { const o = d && object(d, part); if (o) { atoms.push({ ...base, ch: '\uFFFC', obj: o, edit: false }); o.atom = atoms.at(-1); } };
           if (c.namespaceURI === NS.MC && c.localName === 'AlternateContent') {
             const ch = [...c.childNodes].find((x) => x.localName === 'Choice');
             obj(ch && [...ch.childNodes].find((x) => isW(x, 'drawing')));
@@ -934,7 +1067,7 @@ export class DocxProjection {
               else if (t === 'end') fields.pop();
               else if (t === 'separate' && fields.length) {
                 const f = fields.at(-1);
-                f.link = fieldLink(() => f.instr.map((n) => n.textContent).join(''), (v) => { f.instr.forEach((n, i) => { n.textContent = i ? '' : v; }); }, part);
+                f.link = fieldLink(() => f.instr.map((n) => n.textContent).join(''), (v) => { f.instr.forEach((n, i) => { n.textContent = i ? '' : v; }); }, part, { anchor: c });
               }
               break;
             }
@@ -951,7 +1084,7 @@ export class DocxProjection {
           else if (ln === 'ins' || ln === 'moveTo') walk(c, true);
           else if (ln === 'hyperlink' || ln === 'fldSimple') {
             const prev = link;
-            link = (ln === 'hyperlink' ? relLink(c, part) : fieldLink(() => c.getAttributeNS(NS.WORD, 'instr') || '', (v) => c.setAttributeNS(NS.WORD, 'w:instr', v), part)) || link;
+            link = (ln === 'hyperlink' ? relLink(c, part) : fieldLink(() => c.getAttributeNS(NS.WORD, 'instr') || '', (v) => c.setAttributeNS(NS.WORD, 'w:instr', v), part, { field: c })) || link;
             walk(c, locked);
             link = prev;
           } else if (INLINE_WRAP.has(ln)) walk(c, locked);
@@ -963,7 +1096,13 @@ export class DocxProjection {
     };
 
     const md = new MD(marks.ambig);
-    const mkPara = (p, part) => { const atoms = collect(p, part); return atoms.length ? unit({ kind: 'para', el: p, part, atoms }) : null; };
+    const mkPara = (p, part) => {
+      const atoms = collect(p, part);
+      if (!atoms.length) return null;
+      const u = unit({ kind: 'para', el: p, part, atoms });
+      atoms.forEach((a, i) => { a.pid = u.idx; a.off = i; });
+      return u;
+    };
     const listPrefix = (lab, indent) => (lab ? (indent ? '  '.repeat(lab.ilvl) : '') + lab.text + ' ' : '');
     // 段落 p 里的文本框（只取直属 p 的一层；文本框里再套的，等遍历到外框里的段落时再找）
     const scanTextboxes = (p, part) => {
@@ -1055,7 +1194,7 @@ export class DocxProjection {
       seen.add(x.path);
       const part = await load(x.path);
       if (!part) return null;
-      const nodeUnit = (el, mirror) => textUnit(part, el.textContent, (v) => { el.textContent = v; }, mirror ? { mirror, orig: el.textContent } : {});
+      const nodeUnit = (el, mirror) => textUnit(part, el.textContent, (v) => { el.textContent = v; }, { obj: x.obj, label: x.embed === 'chart' ? t.parts.chart : t.parts.smartart, ...(mirror ? { mirror, orig: el.textContent } : {}) });
       if (x.embed === 'chart') {
         const els = [...part.doc.getElementsByTagName('*')].filter((el) => el.textContent.trim() && ((el.namespaceURI === NS.A && el.localName === 't') || (el.namespaceURI === NS.C && el.localName === 'v' && ['strCache', 'strLit'].includes(el.parentNode?.parentNode?.localName))));
         return { title: t.parts.chart + ' ' + baseName(x.path), units: els.map((el) => nodeUnit(el)) };
