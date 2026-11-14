@@ -53,7 +53,7 @@ switch (cmd) {
     const nums = new Map(), nth = (kind, s) => { const m = nums.get(kind) ?? nums.set(kind, new Map()).get(kind); if (!m.has(s)) m.set(s, m.size + 1); return m.get(s); }; // 同类按首次出现编号
     stats = d.replace(sel.map((x) => {
       const s = plainOf(d.md, x.s, x.e);
-      return { s: x.s, e: x.e, text: x.it.del ? '' : replacement(s, rules, { names: [x.it.cat, x.it.en], kind: x.it.cat, nth }) };
+      return { s: x.s, e: x.e, text: x.it.del ? '' : replacement(s, rules, { names: [x.it.cat, x.it.en, x.it.text], kind: x.it.cat, nth }) };
     }));
     break;
   }

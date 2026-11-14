@@ -187,6 +187,17 @@ test('替换模板：白名单求值，不执行任意代码', () => {
   assert.equal(replacement('价$1', parseRules('.* => [{s}]$0')), '[价$1]价$1', '命中文本里的 $1 不再被展开');
 });
 
+test('重命名行「::原文:: => 替换」：=> 前没有正则，只改原文恰好相符的条目', () => {
+  const rules = parseRules('::张三:: => 某甲\n::cname:: .* => 某经理\n.* => **');
+  assert.equal(replacement('张三', rules, { names: ['cname', 'cname', undefined, '张三'] }), '某甲');
+  assert.equal(replacement('张三', rules, { names: ['cname', 'cname', undefined, '李四'] }), '某经理');
+  assert.equal(replacement('张三', rules, { names: [] }), '**');
+  assert.equal(replacement('张三', parseRules('::cname:: => 某经理'), { names: ['cname'] }), '某经理', '前缀是类别名也行');
+  assert.equal(replacement('https://a.b/c', parseRules('::https://a.b/c:: => 网址{nth()}'), { names: ['https://a.b/c'], kind: '网址', nth: () => 2 }), '网址2', '原文可以含冒号');
+  assert.equal(replacement('张三', parseRules('::张三:: => 乙\n::张三:: => 甲'), { names: ['张三'] }), '乙', '重复的取最上面一行');
+  assert.equal(parseRules('=> x').length, 0, '既没有正则也没有前缀：忽略');
+});
+
 const REAL = new URL('../../3、C3443 阀门和旋塞制造-杰林石化-2026江苏省先进级智能工厂申报书.docx', import.meta.url);
 test('样例申报书：标题按样式识别，替换后可再解析', { skip: !existsSync(REAL) }, async () => {
   const buf = readFileSync(REAL);

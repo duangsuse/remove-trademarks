@@ -58,7 +58,7 @@ const doc = { entries: [], dir: null, cur: null, buffer: null, parsed: null, ori
 let pendingModel = null, pendingDir = null; // 上次的模型 / 文件夹句柄，权限待点击后请求
 
 const SPECIAL_CODE = {
-  img: '图片：替换为 1×1 占位图（勾选缩略图可保留）', meta: '.docx 不可见指纹抹除：作者/公司属性、缩略图、批注、修订记录、隐藏文字、rsid/paraId 等',
+  img: '图片：替换为 1×1 占位图（勾选缩略图可保留）', meta: '.docx 作者/公司属性、缩略图、批注、修订记录、隐藏文字等',
   black: '黑名单词汇：左栏黑名单框的词 / #L行号 规则', abbr: () => `以下简称“…” → ${ABBR_RE}`,
   tblname: () => `标签格：${NAME_LABELS}\n姓名值：${NAME_VALUE}\n特殊表格中按行号删除`,
   ner_person: '离线 NER：PERSON', ner_place: '离线 NER：GPE / LOC', ner_cand: '离线 NER：ORG / FAC / PRODUCT / NORP（> 3 字）',
@@ -276,7 +276,7 @@ const ruleNth = (kind, s) => { // 同类（kind）内按首次出现顺序编号
   if (!m.has(key)) m.set(key, m.size + 1);
   return m.get(key);
 };
-const replOf = (it, text) => (it.del ? '' : replacement(text, rules(), { names: [it.cat, it.en, it.type], kind: kindOf(it), nth: ruleNth }));
+const replOf = (it, text) => (it.del ? '' : replacement(text, rules(), { names: [it.cat, it.en, it.type, it.text], kind: kindOf(it), nth: ruleNth }));
 
 function updateCounts() {
   const cnt = {};
@@ -299,9 +299,11 @@ function panelOf(it) {
 }
 const kindOf = (it) => (it.cat === 'tblname' && it.del ? '含姓名表格 · 行号' : it.cat === 'black' ? (it.del ? '行号' : '手动') : it.cat === 'ner' ? TYPE_NAME[it.type] || it.type : RULES[it.cat]?.name || it.label || '规则');
 // 两种条目视图，开关都由 data-key 所在元素的点击统一处理（见 rightEl click）
-const chip = (it) => `<span class="badge ${cls(it)} ${isOn(it) ? 'on' : 'off'}" data-key="${esc(it.key)}" title="${esc(it.text)}">${rankTag(it)}${esc(it.show || it.text)}<small>${it.occ.length}</small></span>`;
+let renames = new Map(); // 原文 -> 替换：#rules 里的「::原文:: => 替换」行，renderPanels 时重读
+const renTag = (it) => (renames.has(it.text) ? `<span class="rn">→ ${esc(renames.get(it.text))}</span>` : '');
+const chip = (it) => `<span class="badge ${cls(it)} ${isOn(it) ? 'on' : 'off'}" data-key="${esc(it.key)}" title="${esc(it.text)}">${rankTag(it)}${esc(it.show || it.text)}${renTag(it)}<small>${it.occ.length}</small></span>`;
 const scoreOf = (it) => `<span class="score">${it.cat === 'ner' ? it.score.toFixed(2) : '0'}</span>`;
-const rowOf = (it, extra = '') => `<div class="row ${isOn(it) ? 'on' : ''} ${top.get(it.key) || ''}" data-key="${esc(it.key)}"><input type="checkbox" ${isOn(it) ? 'checked' : ''}><div class="t">${rankTag(it)}${esc(it.show ? it.show + ' ' : '')}${esc(it.text)}<small>${kindOf(it)} · ${it.occ.length}次</small></div>${extra}${locBtn(it)}<button class="ren" data-ren="${esc(it.key)}" title="重命名（留空即删除）">✎</button></div>`;
+const rowOf = (it, extra = '') => `<div class="row ${isOn(it) ? 'on' : ''} ${top.get(it.key) || ''}" data-key="${esc(it.key)}"><input type="checkbox" ${isOn(it) ? 'checked' : ''}><div class="t">${rankTag(it)}${esc(it.show ? it.show + ' ' : '')}${esc(it.text)}${renTag(it)}<small>${kindOf(it)} · ${it.occ.length}次</small></div>${extra}${locBtn(it)}<button class="ren" data-ren="${esc(it.key)}" title="重命名：替换成别的文字，记在替换规则框里">✎</button></div>`;
 // 四张卡片：#<id>List 放条目，#cnt-<id> 显示 选中 OF 总数；只在视图、空提示、置信度上有差别。条目一律按出现次数从多到少
 const PANELS = [
   { id: 'ent', item: (it) => rowOf(it), empty: () => '暂无。点下方 Add，或在正文选中文字按 Delete' },
@@ -311,6 +313,7 @@ const PANELS = [
 ];
 const panels = Object.fromEntries(PANELS.map((p) => [p.id, []]));
 function renderPanels() {
+  renames = new Map(rules().filter((r) => r.whole).reverse().map((r) => [r.only, r.rep])); // 重复的取最上面一行
   for (const k in panels) panels[k] = [];
   for (const it of live) panels[panelOf(it)].push(it);
   for (const p of PANELS) {
@@ -380,9 +383,12 @@ rightEl.addEventListener('click', (e) => {
   const r = e.target.closest('[data-ren]');
   if (r) {
     const it = items.get(r.dataset.ren); if (!it) return;
-    const t = prompt('重命名（留空即删除）', it.text);
-    if (t === null) return;
-    edit(() => { setOn(it, false); if (t.trim()) boxAdd(t.trim()); });
+    if (it.del) return status('行号规则是整段删除，没有替换文字可改');
+    const cur = isOn(it) ? renames.get(it.text) ?? replOf(it, it.text) : it.text; // 已勾选才显示替换结果，否则照原文
+    const t = prompt(`把「${it.text}」替换为（留空 = 不再打码）`, cur);
+    const to = t?.trim();
+    if (to === undefined || to === cur) return;
+    edit(() => { setOn(it, !!to); if (to) $('rules').value = `::${it.text}:: => ${to}\n` + $('rules').value; }); // 新的写在最上面，自上而下取第一条
     return;
   }
   // 切换开关：芯片 / 行（含复选框本身，键盘空格也会触发 click）统一在这里；随后 run() 重绘，复选框状态以 isOn 为准
@@ -571,10 +577,43 @@ const applyAll = () => guarded(async () => {
   const fh = granted ? await fs.child(await outDir(true), outName(), true) : await fs.pickSave(outName(), DOCX_TYPE);
   await fs.write(fh, blob);
   doc.outHandle = fh;
+  const mh = granted && !EDITOR ? await saveManual() : null; // 没有文件夹权限（另存为）时不写
   alertList(`已写入 ${fh.name}，但有以下问题：`, warnings);
   if (EDITOR) return status(`已保存 ${fh.name}：${stats.del} 删 / ${stats.ins} 插` + (stats.skipped ? `，${stats.skipped} 处无法映射` : ''));
-  status(`已生成 ${fh.name}：${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · Ctrl ⏎ 可生成审阅修订');
+  status(`已生成 ${fh.name}：${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + (mh ? ` · 手动修正/${mh.name}` : '') + ' · Ctrl ⏎ 可生成审阅修订');
 });
+
+// 手动修正/{}.txt：左栏两个框的内容（=== 以下就是右栏状态）。Ctrl+S 时写出，打开文档 / NER 完成时读回
+const MANUAL_DIR = '手动修正';
+const manualName = (ent = doc.cur) => ent.name.replace(/\.docx$/i, '') + '.txt';
+async function saveManual() {
+  const fh = await fs.child(await fs.subdir(doc.dir, MANUAL_DIR, true), manualName(), true);
+  await fs.write(fh, [...$('rules').value.split('\n').filter((l) => l.includes('=>')), blackEl.value].join('\n')); // 含 => 的行是规则，其余是黑名单框
+  return fh;
+}
+let saved = null; // 载入的 手动修正：右栏当时选中的文字（=== 以下 + 手填词）
+async function loadManual(ent) {
+  saved = null;
+  if (EDITOR || !doc.dir || !(await fs.allowed(doc.dir))) return;
+  try {
+    const dir = await fs.subdir(doc.dir, MANUAL_DIR), fh = dir && (await fs.child(dir, manualName(ent)));
+    if (!fh) return;
+    const ls = (await (await fs.file(fh)).text()).split('\n'), black = ls.filter((l) => !l.includes('=>')).join('\n'), { entries, synced } = BlackBox.load(black);
+    blackEl.value = black; $('rules').value = ls.filter((l) => l.includes('=>')).join('\n');
+    saved = new Set([...entries, ...synced]);
+  } catch (e) { console.error(e); }
+}
+// 存档里没有的文字（识别出来的新条目）一律不勾选；用户已手动改过的不动。有变化返回真
+function restoreOn() {
+  if (!saved) return false;
+  let n = 0;
+  for (const it of items.values()) {
+    if (it.cat === 'black' || it.key in state.on) continue;
+    const on = saved.has(it.text);
+    if (on !== isOn(it)) { state.on[it.key] = on; n++; }
+  }
+  return n > 0;
+}
 
 // 审阅面板：只读取并对比 A（已载入的原文）与 脱敏/A，差异作为修订写入 A；不看黑名单，也可当 diff 用
 const reviewToA = () => guarded(async () => {
@@ -634,12 +673,18 @@ function updatePill() {
   renderPill();
 }
 // 悬停提示：把 title 挪到 data-tip（去掉原生气泡），mouseover / mouseout 时在底部状态栏显示 / 还原
-function showTip(t) {
+function setTip(t) {
   const st = $('status');
   if (t && !tip) statusText = st.textContent;
   if (!t && !tip) return;
   tip = t;
   st.textContent = t || statusText;
+}
+let tipTm = 0, tipWant = '';
+function showTip(t) { // 长提示（含换行或 >= 35 字）：悬停 1 秒才显示（同一个提示等待期间不重新计时）
+  if (t === tipWant) return;
+  tipWant = t; clearTimeout(tipTm);
+  if (t.includes('\n') || [...t].length >= 35) { setTip(''); tipTm = setTimeout(() => setTip(t), 1000); } else setTip(t);
 }
 addEventListener('mouseover', (e) => {
   const el = e.target.closest?.('[title], [data-tip]');
@@ -668,10 +713,13 @@ async function openDoc(i, auto = false, noNer = false) {
   doc.images = await listImages(p.zip);
   resetKeep();
   ta.value = p.md; ta.setSelectionRange(0, 0); ta.scrollTop = 0; state.ner = []; state.on = {}; memo.clear(); 
-  doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0; blackEl.value = BlackBox.dump({ own: black().words }); // 保留黑名单词，行号规则属于旧文档故丢弃
+  doc.outHandle = null; lastN = null; undoS.length = redoS.length = 0;
+  await loadManual(ent); // 有存档就以存档为准，否则保留黑名单词（行号规则属于旧文档故丢弃）
+  if (!saved) blackEl.value = BlackBox.dump({ own: black().words });
   $('title').textContent = ent.name.replace(/\.docx$/i, '');
   setFileInfo(ent.name, file.size); setHash(ent.name);
-  run(); status('已载入 · Ctrl S → 脱敏/{}.docx · Ctrl ⏎ 审阅面板 → A');
+  run(); if (restoreOn()) run();
+  status(saved ? '已载入 · 已读回 手动修正/' + manualName() : '已载入 · Ctrl S → 脱敏/{}.docx · Ctrl ⏎ 审阅面板 → A');
   alertList(`${ent.name}：以下内容没有处理`, p.warnings);
   if (noNer) { nerAbort?.abort(); setNerInfo(''); $('bannerText').textContent = '已切换文档（未做 NER）：点右上 ▲▼ 重新选中本文档即可识别。'; }
   else if (ner.ready()) runNer();
@@ -683,7 +731,7 @@ async function runNer() {
   nerAbort?.abort(); // 切换文档 / 重新识别时，丢弃上一轮
   const ac = nerAbort = new AbortController();
   const lines = nerLines(doc.orig);
-  const base = EDITOR ? '纯文本投影编辑器：直接修改文本，Ctrl+S 保存为 原名_新版.docx；右栏只在首次打开和粘贴时识别。' : '已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。';
+  const base = EDITOR ? '纯文本投影编辑器：直改docx内文本，Ctrl+S 保存为 原名_新版.docx；右栏用于手工修订' : '已提取纯文本部分，普通表格按行对应，复杂表格1格1行。请确保处理敏感文字。【右键点规则/专利号即可在全文中定位】';
   $('bannerText').textContent = '离线 NER 识别中…'; setNerInfo('NER 识别中…');
   const t0 = performance.now();
   try {
@@ -703,6 +751,7 @@ async function runNer() {
     console.error(e); $('bannerText').textContent = 'NER 失败：' + e.message; setNerInfo(''); batch = false;
   }
   EDITOR ? scanPanels() : run();
+  if (!EDITOR && restoreOn()) run(); // NER 条目这时才出现，存档里没有的不勾选
   if (!EDITOR) await nextBatch();
 }
 // 批量缓存：NER 完成时若文件列表 > 4 项，问一次是否把其余文件也依次跑完（结果进 NER 缓存），全自动逐个打开

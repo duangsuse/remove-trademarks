@@ -175,10 +175,11 @@ function expand(rep, m, kind, nth) {
   // 一遍完成：展开结果里的 $1 等不会再被当成分组引用
   return rep.replace(/\{([^{}]+)\}|\$(\d)/g, (all, expr, k) => (expr !== undefined ? evalTpl(expr, vars, nth) ?? all : m[+k] ?? ''));
 }
-// ctx：names 该条目的类别名（供 ::类别:: 前缀匹配），kind 显示名，nth(kind, s) 编号函数
+// ctx：names 该条目的类别名与原文（供 ::类别:: / ::原文:: 前缀匹配），kind 显示名，nth(kind, s) 编号函数
 export function replacement(text, rules, { names = [], kind = '', nth = null } = {}) {
   for (const r of rules) {
     if (r.only && !names.includes(r.only)) continue;
+    if (r.whole) return expand(r.rep, [text], kind, nth); // 「::原文:: 替换」
     if (!r.test.test(text)) continue;
     r.re.lastIndex = 0;
     return text.replace(r.re, (...a) => (a[0] === '' ? '' : expand(r.rep, a.slice(0, a.findIndex((x) => typeof x === 'number')), kind, nth))); // 空匹配（.* 在末尾多匹配一次）不展开

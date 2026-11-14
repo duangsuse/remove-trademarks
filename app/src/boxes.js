@@ -25,15 +25,16 @@ export const BlackBox = {
 };
 
 // 替换规则框：每行「[::类别::] 正则 => 替换」，类别前缀只作用于该类别（cat / en / NER 类型）
+// =>前面没有正则（「::原文:: => 替换」）：整段换成「替换」，前缀可以是条目原文——右栏 ✎ 重命名写的就是这种行
 export function parseRules(text) {
   const rules = [];
   for (const ln of text.split('\n')) {
     const i = ln.indexOf('=>');
     if (i < 0) continue;
     let re = ln.slice(0, i).trim();
-    const rep = ln.slice(i + 2).trim(), pre = /^::([^:]+)::\s*/.exec(re);
+    const rep = ln.slice(i + 2).trim(), pre = /^::(.+?)::\s*/.exec(re);
     if (pre) re = re.slice(pre[0].length);
-    if (!re) continue;
+    if (!re) { if (pre) rules.push({ whole: true, only: pre[1].trim(), rep }); continue; }
     try { rules.push({ test: new RegExp('^(?:' + re + ')$'), re: new RegExp(re, 'g'), rep, only: pre ? pre[1].trim() : '' }); } catch { /* 忽略无效规则 */ }
   }
   return rules;
