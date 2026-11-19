@@ -156,6 +156,84 @@ test('含姓名表格：姓名中间有空白也能命中，命中即整个表�
   assert.deepEqual(it.occ.map(([s, e]) => md.slice(s, e)), ['| 姓名 | 张 三 |\n| 联系人： | 李　四： |']);
 });
 
+test('含姓名表格：写入时连表格元素一起删（普通表 / 特殊表；审阅模式标成行删除），不留逐行残余', async () => {
+  const merged = `<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr>${p(t('联系人'))}</w:tc></w:tr><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr>${p(t('李四'))}</w:tc></w:tr></w:tbl>${p(t('尾'))}`;
+  const data = await sample(merged);
+  const run = async (revisions) => {
+    const d = await DocxProjection.load(data);
+    const items = [...scan(d.md, st([])).values()].filter((it) => it.cat === 'tblname');
+    assert.equal(items.length, 2);
+    const sel = selection(items, () => true);
+    assert.equal(d.splice(sel.map((x) => ({ ...x, text: '' }))).skipped, 0);
+    const out = (await d.save({ revisions, type: 'uint8array' })).data;
+    return { d, xml: await (await JSZip.loadAsync(out)).file('word/document.xml').async('string'), out };
+  };
+  const a = await run(false);
+  assert.doesNotMatch(a.xml, /<w:tbl>|<w:tr>|<w:tr /, '表格元素整个删掉');
+  assert.doesNotMatch(a.xml, />姓名<|李四|a\|b|x\*y/);
+  assert.match(a.xml, /尾/);
+  const b = await run(true);
+  assert.equal((b.xml.match(/<w:tbl>/g) || []).length, 2, '审阅模式保留表格');
+  assert.equal((b.xml.match(/<w:trPr><w:del /g) || []).length, 4, '每一行都标成行删除');
+  assert.equal(b.xml.split('</w:tr>').length - 1, 4);
+  const back = await DocxProjection.load(b.out);
+  assert.equal(back.md, b.d.md, '载入时撤回自己的修订，行删除标记一并撤掉');
+});
+
+test('审阅写入 B：A 里有而 B 里删掉的整张表，以插入的行放回（不散落成插入文字），载入时撤回', async () => {
+  const tb = (a, b, c, d) => `<w:tbl><w:tr><w:tc>${p(t(a))}</w:tc><w:tc>${p(t(b))}</w:tc></w:tr><w:tr><w:tc>${p(t(c))}</w:tc><w:tc>${p(t(d))}</w:tc></w:tr></w:tbl>`;
+  const body = (mid) => p(t('前文 姓名 电话')) + mid + p(t('后文 张三 138 电话'));
+  const mk = async (b) => { const z = await JSZip.loadAsync(await sample()); z.file('word/document.xml', `<?xml version="1.0"?><w:document ${W} ${DRAW}><w:body>${b}<w:sectPr/></w:body></w:document>`); return z.generateAsync({ type: 'uint8array' }); };
+  const a = await DocxProjection.load(await mk(body(tb('姓名', '张三', '电话', '138') + p(t('间')) + tb('甲', '乙', '丙', '丁'))));
+  const bData = await mk(body(p(t('间')) + tb('甲', '乙', '丙', '丁')));
+  const b = await DocxProjection.load(bData);
+  assert.equal(a.tables.length, 2);
+  const stats = b.diffMd(a.md, { from: a });
+  assert.equal(stats.ins, 1, '只放回缺的那一张表');
+  const out = (await b.save({ revisions: true, type: 'uint8array' })).data;
+  const xml = await (await JSZip.loadAsync(out)).file('word/document.xml').async('string');
+  assert.equal((xml.match(/<w:tbl>/g) || []).length, 2);
+  assert.equal((xml.match(/<w:trPr><w:ins /g) || []).length, 2, '放回的两行标成行插入');
+  assert.match(xml, /<w:ins [^>]*><w:r><w:t[^>]*>张三<\/w:t><\/w:r><\/w:ins>/, '文字在插入的 run 里');
+  assert.ok(xml.indexOf('前文') < xml.indexOf('>姓名<') && xml.indexOf('>姓名<') < xml.indexOf('>间<'), '位置：前文之后、间之前');
+  assert.doesNotMatch(xml.replace(/<w:tbl>.*?<\/w:tbl>/gs, ''), /w:ins [^>]*><w:r><w:t[^>]*>(?:姓名|张三|138)/, '表外没有散落的插入文字');
+  const back = await DocxProjection.load(out);
+  assert.equal(back.md, b.md, '载入时撤回：行、表一并撤掉');
+  const plain = await DocxProjection.load(await mk(body(p(t('间')) + tb('甲', '乙', '丙', '丁'))));
+  const c = plain.diffMd(a.md, { from: a });
+  assert.equal(c.ins, 1);
+  const x2 = await (await JSZip.loadAsync((await plain.save({ type: 'uint8array' })).data)).file('word/document.xml').async('string');
+  assert.equal((x2.match(/<w:tbl>/g) || []).length, 2, '非审阅模式直接放回');
+  assert.doesNotMatch(x2, /<w:ins /);
+});
+
+test('审阅写入 B：表格里整行缺失的行以插入的行放回对应位置，脱敏过的行照常逐字比', async () => {
+  const row = (a, b) => `<w:tr><w:tc>${p(t(a))}</w:tc><w:tc>${p(t(b))}</w:tc></w:tr>`;
+  const mk = async (rows) => { const z = await JSZip.loadAsync(await sample()); z.file('word/document.xml', `<?xml version="1.0"?><w:document ${W} ${DRAW}><w:body>${p(t('前文 姓名 电话'))}<w:tbl>${rows.map((r) => row(...r)).join('')}</w:tbl>${p(t('后文'))}<w:sectPr/></w:body></w:document>`); return z.generateAsync({ type: 'uint8array' }); };
+  const a = await DocxProjection.load(await mk([['项目', '内容'], ['姓名', '张三'], ['电话', '13812345678'], ['邮箱', 'a@b.c']]));
+  const b = await DocxProjection.load(await mk([['项目', '内容'], ['电话', '某某'], ['邮箱', 'a@b.c']]));
+  const st = b.diffMd(a.md, { from: a });
+  assert.equal(st.ins >= 1, true);
+  const out = (await b.save({ revisions: true, type: 'uint8array' })).data;
+  const xml = await (await JSZip.loadAsync(out)).file('word/document.xml').async('string');
+  assert.equal(xml.split('</w:tr>').length - 1, 4, '放回缺的那一行，共 4 行');
+  assert.equal((xml.match(/<w:trPr><w:ins /g) || []).length, 1);
+  assert.match(xml, /<w:tr><w:trPr><w:ins [^>]*\/><\/w:trPr><w:tc><w:p><w:pPr><w:rPr><w:ins [^>]*\/><\/w:rPr><\/w:pPr><w:ins [^>]*><w:r><w:t[^>]*>姓名/, '整行标成插入，不是散字');
+  assert.ok(xml.indexOf('>项目<') < xml.indexOf('>姓名<') && xml.indexOf('>姓名<') < xml.indexOf('>电话<'), '位置在表头与电话行之间');
+  const back = await DocxProjection.load(out);
+  assert.equal(back.md, b.md, '载入时撤回');
+});
+
+test('行号区间只盖住表格的部分行：只删被整行盖住的行', async () => {
+  const d = await DocxProjection.load(await sample());
+  const t0 = d.tables[0], r1 = t0.rows[1];
+  d.splice([{ s: r1.s, e: r1.e, text: '' }]);
+  const xml = await (await JSZip.loadAsync((await d.save({ type: 'uint8array' })).data)).file('word/document.xml').async('string');
+  assert.equal(xml.split('</w:tr>').length - 1, 1);
+  assert.match(xml, /张三/);
+  assert.doesNotMatch(xml, /x\*y/);
+});
+
 test('nerLines：只清空表格分隔行，纯 ASCII 的表格行照常送 NER', () => {
   assert.deepEqual(nerLines(`| --- | --- |\n| John Smith | IBM Corp |\n${MARK.open}x\n${MARK.close}\n---`), ['', '  John Smith   IBM Corp  ', '', '', '']);
 });

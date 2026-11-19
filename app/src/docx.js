@@ -38,6 +38,7 @@ export const I18N = {
     newImages: (n) => `${n} 处新增图片被忽略（图片只能删除、移动或复制文档里已有的：路径须与原图相同，且在同一部分——正文 / 页眉等不能互相搬）`,
     untracked: (n) => `${n} 处页眉页脚里的图表 / SmartArt / 链接文字已直接改动（那里加不了批注）`,
     failed: (n) => `${n} 段写入失败（详见控制台），这些段落保持原样`,
+    tableLost: (n) => `${n} 张表格没有找到可以放回的位置，没写入`,
     unmerged: (n) => `${n} 处段落合并没写入（后面不是段落，或会删掉分节符）`,
     foreign: (n) => `${n} 处插入落在别人的修订里，没写入`,
     smartArt: (n) => `SmartArt 缓存里有 ${n} 处文字没对上，可能还残留原文（在 Word 里点一下该 SmartArt 会重新排版）`,
@@ -170,12 +171,13 @@ function runFmt(r, style) {
 // （可编辑字是 off + 1；不可编辑的原子如 <br> 也是 off + 1；它前面的标记、转义是 off，即插在原子之前）；
 // brk：段落之间的换行代表哪个段落的段落标记（删掉它 = 与下一段合并），其余为 -1
 class MD {
-  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; this.aft = []; this.brk = []; this.imgs = []; }
+  constructor(ambig) { this.ambig = ambig; this.out = []; this.pid = []; this.off = []; this.ed = []; this.aft = []; this.brk = []; this.imgs = []; this.tbls = []; }
   push(str, pid, off, ed, aft = off + ed, brk = -1) { for (let i = 0; i < str.length; i++) { this.out.push(str[i]); this.pid.push(pid); this.off.push(off); this.ed.push(ed); this.aft.push(aft); this.brk.push(brk); } }
   s(str) { this.push(str, -1, 0, 0); }
   sp(str, para, off, aft = off) { this.push(str, para.idx, off, 0, aft); }
   mark(str, para) { this.push(str, -1, 0, 0, 0, para.idx); } // 段落标记
-  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = this.aft.length = this.brk.length = n; this.imgs = this.imgs.filter((x) => x.e <= n); }
+  cut(n) { this.out.length = this.pid.length = this.off.length = this.ed.length = this.aft.length = this.brk.length = n; this.imgs = this.imgs.filter((x) => x.e <= n); this.tbls = this.tbls.filter((x) => x.e <= n); }
+  trim(n) { while (n > 0 && this.out[n - 1] === '\n') n--; return n; } // 去掉末尾换行后的位置
   get length() { return this.out.length; }
 }
 const marker = (f) => (f === 'bi' ? '***' : f === 'b' ? '**' : '*');
@@ -274,6 +276,12 @@ function plainTable(tbl) {
 function rejectOurs(doc, author) {
   let n = 0;
   const byTag = (t) => [...doc.getElementsByTagNameNS(NS.WORD, t)].filter((x) => x.getAttributeNS(NS.WORD, 'author') === author);
+  for (const x of byTag('ins')) { // 整行是我们插入的（见 markInserted）：整行撤掉，表格没有行了连表格一起撤掉
+    if (x.parentNode?.localName !== 'trPr') continue;
+    const tr = x.parentNode.parentNode, tbl = tr.parentNode;
+    tr.remove(); n++;
+    if (tbl && isW(tbl, 'tbl') && !kids(tbl, 'tr').length) tbl.remove();
+  }
   for (const x of byTag('ins')) { if (x.parentNode && x.parentNode.localName !== 'rPr') { x.remove(); n++; } }
   for (const x of byTag('del')) {
     if (!x.parentNode || x.parentNode.localName === 'rPr') continue;
@@ -344,6 +352,10 @@ class Edits extends Map {
   }
   merge(pid) { this.of(pid).merge = true; } // 删掉段落标记：与下一段合并
   fmt(pid, off, bits) { this.of(pid).fmt.set(off, bits); } // 改粗斜体：位 1 粗、位 2 斜
+  rows = new Map(); // 要整行删除的 w:tr -> 所在部件
+  tbls = new Map(); // 要整表删除的 w:tbl -> 所在部件
+  rowIns = []; // 要插入的行 [{after（本文档里的 w:tr）, el（来自另一个文档的 w:tr）}]
+  tblIns = []; // 要整表插入的 [{pos（md 坐标）, el（来自另一个文档的 w:tbl）}]
   dropObj(img) { const e = this.of(img.pid); if (!e.drop.has(img.off)) { e.drop.add(img.off); this.dropped.push(img); } }
 }
 // md 区间 [a, b) 整个包住的图片（只包住一半的不算：结构字符不可编辑）
@@ -358,7 +370,7 @@ function insertAnchor(map, p) {
 
 // diffMd 插入的文字只取新 md 里的「内容」：来自另一个投影时取它的可编辑字符和整张图片（图片是移动 / 复制），
 // 否则按纯文本投影去掉转义与粗斜体标记。返回 (at, n) -> 新 md [at, at + n) 里的内容，写法同 splice 的 text：\n 分段、\u2028 软换行
-function contentOf(newMd, from) {
+function contentOf(newMd, from, drop = []) {
   const keep = new Array(newMd.length).fill('');
   if (from) {
     for (let i = 0; i < newMd.length; i++) if (from.ed[i] || from.brk[i] >= 0) keep[i] = newMd[i];
@@ -370,6 +382,7 @@ function contentOf(newMd, from) {
       keep[c === BR ? ms : me - 1] = c;
     }
   }
+  for (const [a, b] of [...drop].reverse()) keep.splice(a, b - a);
   return (at, n) => keep.slice(at, at + n).join('').replace(/\r\n?/g, '\n');
 }
 
@@ -508,6 +521,52 @@ function mergeMark(el, ctx) {
   const pPr = kid(n, 'pPr'), at = pPr ? pPr.nextSibling : n.firstChild;
   for (const p of chain) { for (const c of [...p.childNodes]) if (!isW(c, 'pPr')) n.insertBefore(c, at); p.remove(); }
   return true;
+}
+
+// 克隆来的整张表标成插入：每行 trPr 加 w:ins，每个段落标记标插入，每个 run 包进 w:ins；原文档里已被删除的 run 直接丢掉
+function markInserted(tbl, ctx) {
+  const doc = tbl.ownerDocument;
+  for (const d of [...tbl.getElementsByTagNameNS(NS.WORD, 'del')]) if (d.parentNode?.localName !== 'rPr' && d.parentNode?.localName !== 'trPr') d.remove();
+  for (const x of [...tbl.getElementsByTagNameNS(NS.WORD, 'ins')]) {
+    if (x.parentNode?.localName === 'rPr' || x.parentNode?.localName === 'trPr') { x.remove(); continue; }
+    while (x.firstChild) x.parentNode.insertBefore(x.firstChild, x);
+    x.remove();
+  }
+  for (const tr of [...(isW(tbl, 'tr') ? [tbl] : []), ...tbl.getElementsByTagNameNS(NS.WORD, 'tr')]) {
+    let pr = kid(tr, 'trPr');
+    if (!pr) { pr = mkEl(doc, 'trPr'); tr.insertBefore(pr, [...tr.childNodes].find((c) => c.nodeType === 1 && !isW(c, 'tblPrEx')) || null); }
+    pr.insertBefore(mkEl(doc, 'ins', ctx.meta()), kid(pr, 'del') || kid(pr, 'trPrChange') || null);
+  }
+  for (const p of [...tbl.getElementsByTagNameNS(NS.WORD, 'p')]) markPara(p, 'ins', ctx);
+  for (const r of [...tbl.getElementsByTagNameNS(NS.WORD, 'r')]) {
+    const w = mkEl(doc, 'ins', ctx.meta());
+    r.parentNode.insertBefore(w, r);
+    w.appendChild(r);
+  }
+}
+
+// 整行 / 整表删除：审阅模式给每行的 trPr 加 w:del（行里的文字已标成删除），否则直接移除；表格一行不剩就连表格一起移除
+function dropRows({ rows, tbls }, ctx) {
+  const all = new Map(rows);
+  for (const [tbl, part] of tbls) for (const tr of unwrap(tbl, 'tr')) all.set(tr, part);
+  const owner = (n) => { while (n && !isW(n, 'tbl')) n = n.parentNode; return n; };
+  const gone = (el) => {
+    const up = el.parentNode;
+    el.remove();
+    if (up && isW(up, 'tc') && !kids(up, 'p').length) up.appendChild(mkEl(up.ownerDocument, 'p')); // 单元格不能没有段落
+  };
+  const tables = new Map();
+  for (const [tr, part] of all) {
+    part.dirty = true;
+    if (!ctx.track) { const t = owner(tr); if (t) tables.set(t, part); tr.remove(); continue; }
+    const doc = tr.ownerDocument;
+    let pr = kid(tr, 'trPr');
+    if (!pr) { pr = mkEl(doc, 'trPr'); tr.insertBefore(pr, [...tr.childNodes].find((c) => c.nodeType === 1 && !isW(c, 'tblPrEx')) || null); }
+    if (!kid(pr, 'del')) pr.insertBefore(mkEl(doc, 'del', ctx.meta()), kid(pr, 'trPrChange') || null);
+  }
+  if (ctx.track) return;
+  for (const [t, part] of tables) if (!unwrap(t, 'tr').length) tbls.set(t, part);
+  for (const [t, part] of tbls) { part.dirty = true; if (t.parentNode) gone(t); }
 }
 
 // 返回 { dropped：因落在别人修订里而丢掉的插入数, frags：拆段后的各段（第一段是原段落） }
@@ -649,6 +708,7 @@ function maxId(parts) {
 // ---------- 投影 ----------
 export class DocxProjection {
   md = '';
+  tables = []; // 表格在 md 里的区间 [{s, e, full（含后面的空行）, el, part, rows: [{s, e, el}]}]（特殊表格没有 rows，只能整表删）
   images = []; // 图片 / 图表 / SmartArt 在 md 里的整段 [{s, e, pid, off, path（md 里的写法）, file（包内路径，外链为 null）, part, locked}]
   warnings = [];
   unhandled = []; // 投影不了的元素 [{tag: 'm:oMath', count}]，也会汇总进 warnings
@@ -700,7 +760,12 @@ export class DocxProjection {
       for (let i = s; i < e; i++) if (ed[i] && !gone.some((x) => i >= x.s && i < x.e)) { if (first < 0) first = i; this.#edits.del(pid[i], off[i]); }
       const merged = this.#mergesIn(s, e);
       for (const p of merged) this.#edits.merge(p);
-      if (first >= 0 || gone.length || merged.length) st.del++; else if (e > s) st.skipped++; // 只有结构字符：删不掉
+      let rows = 0; // 区间整个盖住的行 / 表格：连结构一起删（只清空文字会留下空表格，行号也对不上）
+      for (const t of this.tables) {
+        if (s <= t.s && e >= t.e) { this.#edits.tbls.set(t.el, t.part); rows++; continue; }
+        for (const r of t.rows) if (s <= r.s && e >= r.e) { this.#edits.rows.set(r.el, t.part); rows++; }
+      }
+      if (first >= 0 || gone.length || merged.length || rows) st.del++; else if (e > s) st.skipped++; // 只有结构字符：删不掉
       let text = raw.replace(/\r\n?/g, '\n').replace(/\n+/g, PS).replaceAll(BR, '\n');
       if (!text) continue;
       let at = first >= 0 ? [pid[first], off[first]] : insertAnchor(map, s);
@@ -734,8 +799,41 @@ export class DocxProjection {
   // 拿改过的整份 md 做 diff，差异作为区间替换交给 splice；没改的字若粗斜体变了，记成格式修改。
   // from：新 md 来自另一个 DocxProjection 时传入，只取它的可编辑字符（和整张图片）
   diffMd(newMd, { from = null } = {}) {
-    const B = from && { ed: from.#map.ed, brk: from.#map.brk, images: from.images };
-    const content = contentOf(newMd, B), diffs = diffSpans(this.md, newMd, IMG_DIFF);
+    // 来自另一个投影时，新 md 里有、本文档里没有的整张表格：摘出来不参与逐字比较（否则表格里的字会和别处相同的字错配、散落成插入文字），
+    // 之后整表克隆进来（审阅模式下是插入的行）。判据：摘掉它之后差异更小
+    const drop = [], miss = [], rowsBefore = this.#edits.rowIns.length;
+    if (from && from.tables.length > this.tables.length) {
+      const cost = (m) => diffSpans(this.md, m, IMG_DIFF).reduce((n, x) => n + (x.e - x.s) + x.text.length, 0);
+      let cur = newMd, now = cost(cur), cut = 0;
+      for (const t of from.tables) {
+        if (t.part.path !== from.#mainPath || this.md.includes(newMd.slice(t.s, t.e))) continue;
+        const a = t.s - cut, b = t.full - cut, next = cur.slice(0, a) + cur.slice(b), c = cost(next);
+        if (c >= now) continue;
+        drop.push([t.s, t.full]); miss.push(t);
+        cur = next; now = c; cut += t.full - t.s;
+      }
+    }
+    // 两边都有的表格里，新 md 有而本文档整行缺失的行：同样摘出来，之后整行克隆回对应的位置（插入的行）
+    if (from) {
+      const mine = (ts, f) => ts.filter((t) => t.part.path === f.#mainPath && !miss.includes(t)), ta = mine(from.tables, from), tb = mine(this.tables, this);
+      if (ta.length === tb.length) ta.forEach((T, i) => this.#missingRows(T, tb[i], drop, newMd));
+    }
+    drop.sort((x, y) => x[0] - y[0]);
+    const kept = (arr) => (drop.length ? Array.from(arr).filter((_, i) => !drop.some(([a, b]) => i >= a && i < b)) : arr);
+    const B = from && { ed: kept(from.#map.ed), brk: kept(from.#map.brk) };
+    const content = contentOf(newMd, from && { ed: from.#map.ed, brk: from.#map.brk, images: from.images }, drop);
+    for (const [a, b] of [...drop].reverse()) newMd = newMd.slice(0, a) + newMd.slice(b);
+    const diffs = diffSpans(this.md, newMd, IMG_DIFF);
+    for (const t of miss) { // 新 md 位置 at -> 本文档 md 位置：落在某处替换的文字里就取它的起点
+      const at = t.s - drop.reduce((n, [a, b]) => (b <= t.s ? n + b - a : n), 0);
+      let delta = 0, pos = -1;
+      for (const x of diffs) {
+        if (at <= x.at) break;
+        if (at < x.at + x.text.length) { pos = x.s; break; }
+        delta += x.e - x.s - x.text.length;
+      }
+      this.#edits.tblIns.push({ pos: pos >= 0 ? pos : at + delta, el: t.el });
+    }
     const spans = [], st = { del: 0, ins: 0, skipped: 0, fmt: 0 };
     for (const x of diffs) {
       if (/^\**$/.test(this.md.slice(x.s, x.e)) && /^\**$/.test(x.text)) continue; // 只动了粗斜体标记：下面按格式比
@@ -758,6 +856,8 @@ export class DocxProjection {
     this.#count(st);
     const r = this.splice(spans);
     r.skipped += st.skipped; r.fmt = st.fmt;
+    const rowsIn = this.#edits.rowIns.length - rowsBefore;
+    r.ins += miss.length + rowsIn; this.#stats.ins += miss.length + rowsIn;
     return r;
   }
 
@@ -854,6 +954,10 @@ export class DocxProjection {
         u.el.replaceWith(backup); // 半途失败的段落整段还原
       }
     }
+    dropRows(this.#edits, ctx);
+    this.#insertRows(ctx);
+    const lost = this.#insertTables(ctx);
+    if (lost) { stats.ins = Math.max(0, stats.ins - lost); stats.skipped += lost; warnings.push(t.warn.tableLost(lost)); }
     let unmerged = 0;
     for (const [, el] of merges.sort((a, b) => a[0] - b[0])) if (!mergeMark(el, ctx)) unmerged++; // 按文档顺序合并
     // 审阅模式下的链接地址：整个链接删 + 插；图表 / SmartArt / 复杂域链接没有修订语法：直接改，在所在段落加批注写明原文
@@ -935,6 +1039,78 @@ export class DocxProjection {
       }
     }
     return ignored;
+  }
+
+  // 整表插入（见 diffMd）：克隆到 pos 前面最近的块之后（文档开头则放在后面第一个块之前）。审阅模式下每行、每个段落标记、每个 run 都标成插入。返回放不下的个数
+  #insertTables(ctx) {
+    const map = this.#map, main = this.#parts.get(this.#mainPath), last = new Map();
+    let lost = 0;
+    const unitAt = (i) => (map.pid[i] >= 0 ? map.pid[i] : map.brk[i] >= 0 ? map.brk[i] : -1);
+    const block = (i) => {
+      const u = this.#units[i];
+      if (u?.kind !== 'para' || u.part !== main) return null;
+      let b = u.el;
+      while (b.parentNode && !isW(b.parentNode, 'body')) b = b.parentNode;
+      return b.parentNode ? b : null;
+    };
+    for (const { pos, el } of [...this.#edits.tblIns].sort((a, b) => a.pos - b.pos)) {
+      let after = true, b = null;
+      for (let i = Math.min(pos, map.pid.length) - 1; i >= 0 && !b; i--) { const k = unitAt(i); if (k >= 0) b = block(k); }
+      if (!b) { after = false; for (let i = pos; i < map.pid.length && !b; i++) { const k = unitAt(i); if (k >= 0) b = block(k); } }
+      if (!b) { lost++; continue; }
+      const tbl = main.doc.importNode(el, true);
+      if (ctx.track) markInserted(tbl, ctx);
+      const prev = last.get(b);
+      if (after) b.parentNode.insertBefore(tbl, (prev || b).nextSibling); else b.parentNode.insertBefore(tbl, b);
+      if (after) last.set(b, tbl);
+      main.dirty = true;
+    }
+    return lost;
+  }
+
+  // 表格 T（新 md 里的）比本文档的对应表格 U 多出的整行：按相似度把 U 的每一行对到 T 的一行（保持顺序，表头对表头），没被对到的就是缺的。
+  // 缺的行的 md 区间记进 drop，克隆来源记进 rowIns。只处理列数相同、没有被删表头的普通表格
+  #missingRows(T, U, drop, newMd) {
+    const n = T.rows.length, m = U.rows.length;
+    if (!m || n <= m || !T.cols || T.cols !== U.cols || n * m > 4000) return;
+    // 按格比：整格相同记 1（标签格一般原样保留），否则按逐字差异记 0~0.5。整行逐字比会偏向短行
+    const cells = (md, r) => md.slice(r.s, r.e).split('\n')[0].slice(2, -2).split(' | ');
+    const sim = (a, b) => {
+      const x = cells(newMd, T.rows[a]), y = cells(this.md, U.rows[b]);
+      return x.reduce((sum, c, k) => {
+        const d = y[k] ?? '';
+        if (c === d) return sum + 1;
+        return sum + 0.5 * (1 - diffSpans(c, d).reduce((n, z) => n + (z.e - z.s) + z.text.length, 0) / (c.length + d.length || 1));
+      }, 0);
+    };
+    const dp = Array.from({ length: n }, () => new Array(m).fill(-Infinity)), pick = Array.from({ length: n }, () => new Array(m).fill(false));
+    dp[0][0] = 0; // 表头对表头
+    for (let i = 1; i < n; i++) for (let j = 0; j <= Math.min(i, m - 1); j++) {
+      const skip = dp[i - 1][j], take = j ? dp[i - 1][j - 1] + sim(i, j) : -Infinity;
+      if (take > skip) { dp[i][j] = take; pick[i][j] = true; } else dp[i][j] = skip;
+    }
+    if (dp[n - 1][m - 1] === -Infinity) return;
+    const at = new Array(n).fill(-1);
+    for (let i = n - 1, j = m - 1; i >= 0 && j >= 0; i--) if (pick[i][j] || (i === 0 && j === 0)) at[i] = j--;
+    let prev = 0;
+    for (let i = 1; i < n; i++) {
+      if (at[i] >= 0) { prev = at[i]; continue; }
+      drop.push([T.rows[i].s, T.rows[i].e + 1]);
+      this.#edits.rowIns.push({ after: U.rows[prev].el, el: T.rows[i].el });
+    }
+  }
+
+  // 整行插入（见 #missingRows）：克隆到对应行之后，同一行后面的按原顺序排。审阅模式下标成插入
+  #insertRows(ctx) {
+    const last = new Map();
+    for (const { after, el } of this.#edits.rowIns) {
+      const row = after.ownerDocument.importNode(el, true);
+      if (ctx.track) markInserted(row, ctx);
+      after.parentNode.insertBefore(row, (last.get(after) || after).nextSibling);
+      last.set(after, row);
+      const part = this.#textParts.find((x) => x.doc === after.ownerDocument);
+      if (part) part.dirty = true;
+    }
   }
 
   #count(st) { for (const k in st) this.#stats[k] += st[k]; return st; }
@@ -1165,7 +1341,9 @@ export class DocxProjection {
         else if (c.localName === 'tbl') {
           const grid = plainTable(c);
           if (grid) {
+            const trs = unwrap(c, 'tr'), rec = { s: md.length, e: 0, el: c, part, cols: grid[0].length, rows: [] };
             grid.forEach((row, ri) => {
+              const rs = md.length;
               row.forEach((p, ci) => {
                 scanTextboxes(p, part);
                 const lab = lists.label(p), para = mkPara(p, part);
@@ -1175,8 +1353,12 @@ export class DocxProjection {
               });
               md.s(' |\n');
               if (ri === 0) md.s('|' + ' --- |'.repeat(row.length) + '\n');
+              rec.rows.push({ s: rs, e: md.trim(md.length), el: trs[ri] });
             });
+            rec.e = md.trim(md.length);
             md.s('\n');
+            rec.full = md.length;
+            md.tbls.push(rec);
           } else {
             const start = md.length;
             md.s(marks.specialBegin);
@@ -1184,7 +1366,7 @@ export class DocxProjection {
             const before = md.length;
             for (const tc of inner) walkCell(tc, part);
             if (md.length === before) md.cut(start);
-            else md.s(marks.specialEnd);
+            else { md.s(marks.specialEnd); md.tbls.push({ s: start, e: md.trim(md.length), full: md.length, el: c, part, cols: 0, rows: [] }); }
           }
         } else stray(c);
       }
@@ -1271,6 +1453,7 @@ export class DocxProjection {
     if (vec.length) warnings.push(t.warn.vectors(vec.length));
 
     this.images = md.imgs;
+    this.tables = md.tbls;
     this.md = md.out.join('');
     this.#map = { pid: Int32Array.from(md.pid), off: Int32Array.from(md.off), ed: Uint8Array.from(md.ed), aft: Int32Array.from(md.aft), brk: Int32Array.from(md.brk) };
   }

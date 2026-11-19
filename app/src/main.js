@@ -583,7 +583,7 @@ const applyAll = () => guarded(async () => {
   if (granted && !reviewed.size) (await outDir(false))?.removeEntry(WARN_FILE).catch(() => {}); // 本会话没有别的带修订文档了，撤掉外发警示
   alertList(`已写入 ${fh.name}，但有以下问题：`, warnings);
   if (EDITOR) return status(`已保存 ${fh.name}：${stats.del} 删 / ${stats.ins} 插` + (stats.skipped ? `，${stats.skipped} 处无法映射` : ''));
-  status(`已生成 ${fh.name}：${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + (mh ? ` · 手动修正/${mh.name}` : '') + ' · Ctrl ⏎ 可生成审阅修订');
+  status(`已生成 ${sel.length} 处脱敏（${stats.del} 删 / ${stats.ins} 插）` + (dropImages.length ? `，${dropImages.length} 张图片已替换` : '') + (state.cats.meta ? '，不可见指纹已抹除' : '') + (stats.skipped ? `，${stats.skipped} 处无法映射` : '') + ' · Ctrl ⏎ 可生成审阅修订');
 });
 
 // 手动修正/{}.txt：左栏两个框的内容（=== 以下就是右栏状态）。Ctrl+S 时写出，打开文档 / NER 完成时读回
